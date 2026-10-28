@@ -15,22 +15,33 @@ class FakeLLM(BaseHTTPRequestHandler):
     script = []      # replies, popped in order: {"content": str} or {"tool": (name, args)}
     requests = []
     n_ctx = 2048
+    ollama = False   # behave like Ollama: no /props, /api/ps + /v1/models, tool calls without index
 
     def log_message(self, *a):
         pass
 
-    def do_GET(self):
-        body = json.dumps({"default_generation_settings": {"n_ctx": self.n_ctx}}).encode()
-        self.send_response(200)
+    def reply_json(self, obj, code=200):
+        self.send_response(code)
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(json.dumps(obj).encode())
+
+    def do_GET(self):
+        if not self.ollama:
+            return self.reply_json({"default_generation_settings": {"n_ctx": self.n_ctx}})
+        if self.path == "/api/ps":
+            return self.reply_json({"models": [{"name": "qwen:7b", "context_length": 8192}]})
+        if self.path == "/v1/models":
+            return self.reply_json({"data": [{"id": "qwen:7b"}]})
+        self.reply_json({"error": "not found"}, 404)
 
     def do_POST(self):
         req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.path == "/api/show":
+            return self.reply_json({"parameters": "num_ctx                        6144"})
         FakeLLM.requests.append(req)
         step = FakeLLM.script.pop(0) if FakeLLM.script else {"content": "ok"}
         delta = {"content": step["content"]} if "content" in step else {"tool_calls": [{
-            "index": 0, "id": "c1", "function": {
+            **({} if self.ollama else {"index": 0}), "id": "c1", "function": {
                 "name": step["tool"][0], "arguments": json.dumps(step["tool"][1])}}]}
         chunks = [{"choices": [{"delta": delta, "finish_reason": None}]},
                   {"choices": [{"delta": {}, "finish_reason": "stop"}]},
@@ -149,7 +160,24 @@ class EndToEnd(Base):
         super().tearDown()
 
     def test_server_ctx(self):
-        self.assertEqual(mh.Client(self.url).server_ctx(), 2048)
+        self.assertEqual(mh.Client(self.url).server_ctx(), (2048, "llama.cpp /props"))
+
+    def test_ollama(self):
+        FakeLLM.ollama = True
+        self.addCleanup(setattr, FakeLLM, "ollama", False)
+        c = mh.Client(self.url)
+        self.assertEqual(c.pick_model(), "qwen:7b")
+        c.model = "qwen:7b"
+        self.assertEqual(c.server_ctx(), (8192, "Ollama /api/ps"))
+        c.model = "other:1b"      # not loaded -> falls back to the Modelfile's num_ctx
+        self.assertEqual(c.server_ctx(), (6144, "Ollama model parameters"))
+        (self.root / "o.txt").write_text("x\n")
+        FakeLLM.script = [{"tool": ("read_file", {"path": "o.txt"})}, {"content": "ok"}]
+        a = mh.Agent(mh.parse_args(["--dir", str(self.root)]), c, self.tools, 4096)
+        a.ctx_guess = True
+        a.run_turn("read")
+        self.assertEqual(a.n_ctx, 6144)
+        self.assertEqual(FakeLLM.requests[1]["messages"][-1]["role"], "tool")
 
     def test_tool_loop_native(self):
         (self.root / "n.txt").write_text("hello world\n")

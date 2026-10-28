@@ -341,16 +341,40 @@ class Client:
         except urllib.error.URLError as e:
             raise LLMError("server not reachable (%s): %s" % (self.base, e.reason))
 
-    def server_ctx(self):
-        """Context size the llama.cpp server runs with, or None."""
-        u = urllib.parse.urlparse(self.base)
+    def _json(self, url, body=None):
         try:
-            with self._open("%s://%s/props" % (u.scheme, u.netloc)) as r:
-                props = json.loads(r.read().decode("utf-8"))
-            n = props["default_generation_settings"]["n_ctx"]
-            return int(n) if n else None
-        except (LLMError, ValueError, KeyError, TypeError, OSError):
+            with self._open(url, body) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except (LLMError, ValueError, OSError):
             return None
+
+    def pick_model(self):
+        """First model the server lists (needed by Ollama; llama.cpp ignores the name)."""
+        data = (self._json(self.base + "/models") or {}).get("data") or []
+        return data[0].get("id", "") if data and isinstance(data[0], dict) else ""
+
+    def server_ctx(self):
+        """(context tokens, source) the server really runs with, or (None, None).
+
+        llama.cpp: /props. Ollama: /api/ps (loaded model) or `num_ctx` of the model's
+        parameters. The model's *trained* maximum is deliberately not used."""
+        u = urllib.parse.urlparse(self.base)
+        root = "%s://%s" % (u.scheme, u.netloc)
+        try:
+            n = int(self._json(root + "/props")["default_generation_settings"]["n_ctx"])
+            if n:
+                return n, "llama.cpp /props"
+        except (KeyError, TypeError, ValueError):
+            pass
+        name = self.model.split(":")[0]
+        for m in (self._json(root + "/api/ps") or {}).get("models") or []:
+            if str(m.get("name", "")).split(":")[0] == name and m.get("context_length"):
+                return int(m["context_length"]), "Ollama /api/ps"
+        show = self._json(root + "/api/show", {"model": self.model}) or {}
+        found = re.search(r"num_ctx\s+(\d+)", str(show.get("parameters", "")))
+        if found:
+            return int(found.group(1)), "Ollama model parameters"
+        return None, None
 
     def chat(self, messages, tools, max_tokens, temperature, on_text=None, on_think=None):
         body = {"model": self.model, "messages": messages, "max_tokens": max_tokens,
@@ -384,7 +408,11 @@ class Client:
                         if on_text:
                             on_text(d["content"])
                     for tc in d.get("tool_calls") or []:
-                        c = calls.setdefault(tc.get("index", 0), {"id": "", "name": "", "args": ""})
+                        idx = tc.get("index")
+                        if idx is None:  # e.g. Ollama: complete calls without index
+                            idx = len(calls) if (tc.get("id") or (tc.get("function") or {}).get("name")) \
+                                else max(calls, default=0)
+                        c = calls.setdefault(idx, {"id": "", "name": "", "args": ""})
                         c["id"] = tc.get("id") or c["id"]
                         fn = tc.get("function") or {}
                         c["name"] = c["name"] or fn.get("name") or ""
@@ -463,6 +491,7 @@ class Agent:
         self.msgs, self.summary = [], ""
         self.ratio = 3.0            # chars per token, calibrated from server usage
         self.used = 0               # tokens of the last request (prompt + reply)
+        self.ctx_guess = False      # n_ctx is only a default guess -> ask the server after 1st reply
         self.tool_json = json.dumps(TOOL_SPECS, separators=(",", ":")) if self.native else ""
 
     # -- sizes
@@ -606,6 +635,12 @@ class Agent:
                 raise
             if started[0]:
                 say()
+            if self.ctx_guess:
+                self.ctx_guess = False
+                real, src = self.client.server_ctx()
+                if real and real != self.n_ctx:
+                    say(dim("[server context is %d tokens (%s), adjusting]" % (real, src)))
+                    self.n_ctx = real
             pt = res["prompt_tokens"]
             if pt:
                 self.ratio = min(6.0, max(1.5, 0.5 * self.ratio + 0.5 * sent / pt))
@@ -665,6 +700,8 @@ class Agent:
                 self.msgs.append({"role": "assistant", "content": "(interrupted)"})
         except (LLMError, ContextError) as e:
             say(paint("31", "error: %s" % e))
+            if "tool" in str(e).lower() and "support" in str(e).lower():
+                say(paint("33", "this model has no tool support; try --protocol text"))
             if self.msgs and self.msgs[-1]["role"] == "user" and not self.msgs[-1].get("_cont"):
                 self.msgs.pop()  # let the user retry without a dangling message
 
@@ -749,11 +786,17 @@ def main(argv=None):
         sys.exit("not a folder: %s" % args.dir)
     client = Client(args.url, args.api_key, args.model)
 
+    if not args.model:
+        client.model = client.pick_model() or client.model
+    detected, dsrc = client.server_ctx()
     n_ctx, src = args.ctx, "--ctx / MINIHARNESS_CTX"
     if not n_ctx:
-        n_ctx, src = client.server_ctx(), "server /props"
+        n_ctx, src = detected, dsrc
     if not n_ctx:
-        n_ctx, src = DEFAULT_CTX, "default (server did not tell; use --ctx)"
+        n_ctx, src = DEFAULT_CTX, "default guess; use --ctx"
+    if args.ctx and detected and detected < args.ctx:
+        say(paint("33", "warning: server runs with only %d tokens (%s); input beyond that is lost. "
+                        "Raise the server's context or lower --ctx." % (detected, dsrc)))
 
     state = {"auto": args.yes}
 
@@ -772,8 +815,9 @@ def main(argv=None):
 
     agent = Agent(args, client, None, n_ctx)
     agent.tools = Tools(root, confirm, agent.tool_cap)
-    say(paint("1", "miniharness") + dim(" · %s · folder %s · context %d tokens (%s) · reply reserve %d" %
-                                        (args.url, agent.tools.root, n_ctx, src, agent.reserve)))
+    say(paint("1", "miniharness") + dim(" · %s · model %s · folder %s · context %d tokens (%s) · reply reserve %d" %
+                                        (args.url, client.model, agent.tools.root, n_ctx, src, agent.reserve)))
+    agent.ctx_guess = not args.ctx and not detected
     fixed = agent.chars([]) / agent.ratio
     if fixed > 0.4 * agent.budget():
         say(paint("33", "warning: system prompt + tools use ~%d of %d tokens; "

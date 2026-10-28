@@ -1,6 +1,6 @@
 # miniharness
 
-Schlanker Terminal-Harness für ein **lokales LLM** (llama.cpp oder jede OpenAI-kompatible API).
+Schlanker Terminal-Harness für ein **lokales LLM** (llama.cpp, Ollama oder jede OpenAI-kompatible API).
 Das Modell kann Textdateien in **einem** Ordner auflisten, lesen, durchsuchen und bearbeiten –
 ausgelegt auf **kleine Kontextfenster**. Eine Datei, nur Python-Standardbibliothek
 (Python ≥ 3.8), läuft unter Linux, macOS und Windows.
@@ -33,12 +33,32 @@ Port 8080 muss in der Firewall des Servers freigegeben sein. Ohne `--api-key` ka
 den Server nutzen. Für lokale/private Adressen werden System-Proxys (`HTTP_PROXY`) umgangen;
 `https://`-URLs funktionieren ebenfalls.
 
+## Ollama
+
+Ollama bietet eine OpenAI-kompatible API unter `/v1`:
+
+```bash
+ollama pull qwen2.5-coder:7b          # Modell mit Tool-Support wählen
+python miniharness.py --url http://127.0.0.1:11434/v1 -m qwen2.5-coder:7b --ctx 8192
+```
+
+- Ohne `-m` wird das erste Modell des Servers genommen (steht in der Startzeile).
+- **Wichtig – Kontext:** Ollama kürzt zu lange Prompts *stillschweigend* (vorne, also inklusive
+  System-Prompt). Das Fenster, mit dem Ollama läuft, wird über die OpenAI-API **nicht** pro Anfrage
+  gesetzt. Stellen Sie es serverseitig ein, z. B. `OLLAMA_CONTEXT_LENGTH=8192 ollama serve` oder in einer
+  Modelfile `PARAMETER num_ctx 8192`, und geben Sie dasselbe mit `--ctx` an.
+  Ohne `--ctx` liest das Harness den Wert aus `/api/ps` bzw. dem `num_ctx` der Modelfile; sonst rät es 4096
+  und korrigiert sich nach der ersten Antwort, sobald Ollama das geladene Modell meldet.
+  Läuft der Server mit weniger als `--ctx`, erscheint eine Warnung.
+- Modelle ohne Tool-Support melden einen Fehler – dann `--protocol text` verwenden.
+- Im Netzwerk: `OLLAMA_HOST=0.0.0.0 ollama serve`, dann wie oben mit der Server-IP und Port 11434.
+
 ## Kontextfenster
 
 Reihenfolge, in der die Größe bestimmt wird:
 
 1. `--ctx N` bzw. Umgebungsvariable `MINIHARNESS_CTX`
-2. automatisch vom llama.cpp-Server (`/props`)
+2. automatisch vom Server (llama.cpp `/props`, Ollama `/api/ps` bzw. `num_ctx`)
 3. Fallback 4096 (mit Hinweis)
 
 Zur Laufzeit mit `/ctx 8192` änderbar. Das Harness hält jede Anfrage unter
