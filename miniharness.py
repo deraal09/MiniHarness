@@ -7,6 +7,7 @@ Only the Python standard library is used (Python >= 3.8, Linux / macOS / Windows
 import argparse
 import codecs
 import difflib
+import ipaddress
 import json
 import os
 import re
@@ -301,12 +302,20 @@ class LLMError(Exception):
         return self.status == 400 and ("context" in m or "exceed" in m or "too long" in m)
 
 
+def _is_local(host):
+    """Loopback, private-network IPs and bare/.local/.lan hostnames: never go through a proxy."""
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_loopback or ip.is_private or ip.is_link_local
+    except ValueError:
+        return "." not in host or host.endswith((".local", ".lan", ".home", ".internal"))
+
+
 class Client:
     def __init__(self, base, key="", model="", timeout=600):
         self.base = base.rstrip("/")
         self.key, self.model, self.timeout = key, model or "local", timeout
-        host = urllib.parse.urlparse(self.base).hostname or ""
-        local = host in ("localhost", "127.0.0.1", "::1")
+        local = _is_local(urllib.parse.urlparse(self.base).hostname or "")
         self.opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}) if local else urllib.request.ProxyHandler())
 

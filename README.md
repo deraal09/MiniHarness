@@ -17,6 +17,22 @@ python miniharness.py --dir ./mein-ordner
 
 Windows: `py miniharness.py --dir C:\pfad\ordner` (Port, URL usw. wie unten).
 
+## Server im lokalen Netzwerk
+
+Das Modell kann auf einem anderen Rechner laufen:
+
+```bash
+# Server-Rechner: auf allen Interfaces lauschen (Standard ist nur 127.0.0.1)
+llama-server -m modell.gguf -c 8192 --jinja --host 0.0.0.0 --port 8080 --api-key geheim
+
+# Client-Rechner
+python miniharness.py --url http://192.168.1.50:8080/v1 --api-key geheim
+```
+
+Port 8080 muss in der Firewall des Servers freigegeben sein. Ohne `--api-key` kann jeder im Netz
+den Server nutzen. Für lokale/private Adressen werden System-Proxys (`HTTP_PROXY`) umgangen;
+`https://`-URLs funktionieren ebenfalls.
+
 ## Kontextfenster
 
 Reihenfolge, in der die Größe bestimmt wird:
