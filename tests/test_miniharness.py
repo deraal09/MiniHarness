@@ -1,0 +1,179 @@
+import json
+import os
+import sys
+import tempfile
+import threading
+import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import miniharness as mh  # noqa: E402
+
+
+class FakeLLM(BaseHTTPRequestHandler):
+    script = []      # replies, popped in order: {"content": str} or {"tool": (name, args)}
+    requests = []
+    n_ctx = 2048
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        body = json.dumps({"default_generation_settings": {"n_ctx": self.n_ctx}}).encode()
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        FakeLLM.requests.append(req)
+        step = FakeLLM.script.pop(0) if FakeLLM.script else {"content": "ok"}
+        delta = {"content": step["content"]} if "content" in step else {"tool_calls": [{
+            "index": 0, "id": "c1", "function": {
+                "name": step["tool"][0], "arguments": json.dumps(step["tool"][1])}}]}
+        chunks = [{"choices": [{"delta": delta, "finish_reason": None}]},
+                  {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                  {"choices": [], "usage": {"prompt_tokens": 100, "completion_tokens": 10}}]
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        for c in chunks:
+            self.wfile.write(("data: %s\n\n" % json.dumps(c)).encode())
+        self.wfile.write(b"data: [DONE]\n\n")
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.asked = []
+        self.tools = mh.Tools(self.root, lambda t, p: self.asked.append(t) or True, lambda: 2000)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+
+class ToolTests(Base):
+    def test_sandbox(self):
+        with self.assertRaises(mh.ToolError):
+            self.tools.read_file("../etc/passwd")
+        with self.assertRaises(mh.ToolError):
+            self.tools.write_file(os.path.abspath(os.sep) + "x.txt", "no")
+
+    def test_read_chunks(self):
+        (self.root / "a.txt").write_text("\n".join("line %d" % i for i in range(1, 500)))
+        t = mh.Tools(self.root, lambda *a: True, lambda: 300)
+        out = t.read_file("a.txt")
+        self.assertIn("start_line=", out)
+        self.assertLess(len(out), 500)
+        self.assertIn("line 1\n", out)
+        self.assertIn("line 499", t.read_file("a.txt", start_line=499))
+
+    def test_edit_and_crlf(self):
+        (self.root / "b.txt").write_bytes(b"one\r\ntwo\r\nthree\r\n")
+        self.assertTrue(self.tools.edit_file("b.txt", "two", "2").startswith("OK"))
+        self.assertEqual((self.root / "b.txt").read_bytes(), b"one\r\n2\r\nthree\r\n")
+        with self.assertRaises(mh.ToolError):
+            self.tools.edit_file("b.txt", "nothing", "x")
+        (self.root / "c.txt").write_text("x x")
+        with self.assertRaises(mh.ToolError):
+            self.tools.edit_file("c.txt", "x", "y")
+
+    def test_write_append_binary_search(self):
+        self.tools.write_file("sub/d.txt", "alpha\nbeta")
+        self.tools.write_file("sub/d.txt", "gamma\n", append=True)
+        self.assertEqual((self.root / "sub" / "d.txt").read_text(), "alpha\nbeta\ngamma\n")
+        (self.root / "bin.dat").write_bytes(b"\x00\x01\x02")
+        with self.assertRaises(mh.ToolError):
+            self.tools.read_file("bin.dat")
+        self.assertIn("sub/d.txt:2: beta", self.tools.search("BETA"))
+        self.assertIn("sub/", self.tools.list_files("."))
+
+    def test_declined(self):
+        t = mh.Tools(self.root, lambda *a: False, lambda: 2000)
+        self.assertEqual(t.write_file("e.txt", "x"), "Declined by user.")
+        self.assertFalse((self.root / "e.txt").exists())
+
+
+class AgentTests(Base):
+    def make_agent(self, n_ctx, **kw):
+        args = mh.parse_args(["--dir", str(self.root)])
+        for k, v in kw.items():
+            setattr(args, k, v)
+        client = mh.Client("http://127.0.0.1:1/v1")
+        return mh.Agent(args, client, self.tools, n_ctx)
+
+    def test_trimming_keeps_budget_and_structure(self):
+        a = self.make_agent(1536, summarize=False)
+        for i in range(12):
+            a.msgs.append({"role": "user", "content": "question %d " % i + "x" * 300})
+            a.msgs.append({"role": "assistant", "content": "", "tool_calls": [
+                {"id": "t%d" % i, "type": "function",
+                 "function": {"name": "read_file", "arguments": json.dumps({"path": "a"})}}]})
+            a.msgs.append({"role": "tool", "tool_call_id": "t%d" % i, "content": "y" * 400})
+            a.msgs.append({"role": "assistant", "content": "answer " + "z" * 200})
+        a.fit()
+        self.assertLessEqual(a.est(), a.budget())
+        self.assertEqual(a.msgs[0]["role"], "user")
+        ids = [t["id"] for m in a.msgs for t in m.get("tool_calls", [])]
+        tool_ids = [m["tool_call_id"] for m in a.msgs if m["role"] == "tool"]
+        self.assertEqual(ids, tool_ids)
+
+    def test_oversized_tool_result_is_cut(self):
+        a = self.make_agent(1536, summarize=False)
+        a.msgs.append({"role": "user", "content": "hi"})
+        a.msgs.append({"role": "assistant", "content": "", "tool_calls": [
+            {"id": "t", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]})
+        a.msgs.append({"role": "tool", "tool_call_id": "t", "content": "y" * 20000})
+        a.fit()
+        self.assertLessEqual(a.est(), a.budget())
+
+    def test_text_call_parsing(self):
+        calls = mh.parse_text_calls('ok\nTOOL: {"name": "read_file", "arguments": {"path": "a"}}')
+        self.assertEqual(calls[0]["name"], "read_file")
+        self.assertIn("error", mh.parse_text_calls('TOOL: {"name": "x", "argu')[0])
+
+
+class EndToEnd(Base):
+    def setUp(self):
+        super().setUp()
+        FakeLLM.requests, FakeLLM.script = [], []
+        self.srv = HTTPServer(("127.0.0.1", 0), FakeLLM)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.url = "http://127.0.0.1:%d/v1" % self.srv.server_port
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+        super().tearDown()
+
+    def test_server_ctx(self):
+        self.assertEqual(mh.Client(self.url).server_ctx(), 2048)
+
+    def test_tool_loop_native(self):
+        (self.root / "n.txt").write_text("hello world\n")
+        FakeLLM.script = [{"tool": ("edit_file", {"path": "n.txt", "old": "world", "new": "there"})},
+                          {"content": "done"}]
+        a = mh.Agent(mh.parse_args(["--dir", str(self.root), "-y"]),
+                     mh.Client(self.url), self.tools, 2048)
+        a.run_turn("change world to there")
+        self.assertEqual((self.root / "n.txt").read_text(), "hello there\n")
+        self.assertEqual(len(FakeLLM.requests), 2)
+        self.assertEqual(FakeLLM.requests[1]["messages"][-1]["role"], "tool")
+        self.assertEqual(a.msgs[-1]["content"], "done")
+        self.assertEqual(a.used, 110)
+
+    def test_tool_loop_text(self):
+        (self.root / "n.txt").write_text("abc\n")
+        FakeLLM.script = [{"content": 'TOOL: {"name": "read_file", "arguments": {"path": "n.txt"}}'},
+                          {"content": "fertig"}]
+        a = mh.Agent(mh.parse_args(["--dir", str(self.root), "--protocol", "text"]),
+                     mh.Client(self.url), self.tools, 2048)
+        a.run_turn("read it")
+        self.assertIn("abc", FakeLLM.requests[1]["messages"][-1]["content"])
+        self.assertNotIn("tools", FakeLLM.requests[0])
+
+
+if __name__ == "__main__":
+    unittest.main()
