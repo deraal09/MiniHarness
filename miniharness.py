@@ -5,13 +5,20 @@ Reads and edits text files inside one folder, built for SMALL context windows.
 Only the Python standard library is used (Python >= 3.8, Linux / macOS / Windows).
 """
 import argparse
+import atexit
 import codecs
+import configparser
 import difflib
 import ipaddress
 import json
 import os
 import re
+import shlex
+import signal
+import socket
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -731,6 +738,239 @@ def _fmt_call(c):
         "%s=%s" % (k, json.dumps(v, ensure_ascii=False)[:40]) for k, v in a.items()))
 
 
+# ------------------------------------------------- config file + server
+CONFIG_NAME = "miniharness.ini"
+HARNESS_KEYS = {"dir", "url", "model", "api_key", "ctx", "max_tokens", "protocol",
+                "temperature", "max_steps", "summarize", "auto_approve"}
+SERVER_KEYS = {"start", "type", "command", "model", "hf_repo", "host", "port", "args",
+               "timeout", "log"}
+
+TEMPLATE = """\
+# miniharness configuration. Lines starting with # or ; are comments
+# (no comments after a value). Relative paths are relative to this file.
+# Precedence: command line > environment (MINIHARNESS_*) > this file.
+
+[harness]
+# Folder the model may read and edit.
+dir = .
+# API base URL. Leave empty to derive it from [server].
+url =
+# Model name (required by Ollama; empty = first model the server lists).
+model =
+api_key =
+# Context window in tokens. Also given to the server that miniharness starts.
+ctx = 8192
+# Tokens reserved for one reply (empty = ctx/4, 256..2048).
+max_tokens =
+# native = OpenAI tool calls, text = plain-text tool protocol (for models/servers without tool support).
+protocol = native
+temperature = 0.2
+max_steps = 20
+# Summarize dropped messages instead of just forgetting them.
+summarize = true
+# Apply file changes without asking.
+auto_approve = false
+
+[server]
+# true: miniharness starts the server if nothing listens on host:port and stops it on exit.
+start = true
+# llama.cpp | ollama | custom
+type = llama.cpp
+# Executable (empty = llama-server / ollama from PATH). For "custom" the full command line;
+# {host}, {port} and {ctx} are replaced.
+command =
+# llama.cpp: path to the .gguf file ... or a Hugging Face repo (downloaded on first start).
+model = /path/to/model.gguf
+hf_repo =
+host = 127.0.0.1
+port = 8080
+# Extra arguments, e.g. --n-gpu-layers 99 --flash-attn on
+args =
+# Seconds to wait until the server answers (loading big models takes a while).
+timeout = 180
+log = miniharness-server.log
+"""
+
+
+def _bool(v):
+    if str(v).strip().lower() in ("1", "true", "yes", "on", "ja"):
+        return True
+    if str(v).strip().lower() in ("0", "false", "no", "off", "nein"):
+        return False
+    raise ValueError(v)
+
+
+def split_cmd(text):
+    """Split a command line; keeps Windows backslashes intact."""
+    parts = shlex.split(text, posix=os.name != "nt")
+    return [p[1:-1] if len(p) > 1 and p[0] == p[-1] and p[0] in "\"'" else p for p in parts]
+
+
+class Config:
+    """Settings from miniharness.ini ([harness] and [server])."""
+
+    def __init__(self, path=None):
+        self.path = path
+        self.base = path.parent if path else Path.cwd()
+        self.h, self.s = {}, {}
+        if not path:
+            return
+        cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=None)
+        try:
+            cp.read(str(path), encoding="utf-8-sig")
+        except configparser.Error as e:
+            sys.exit("config error in %s: %s" % (path, e))
+        for sect, store, known in (("harness", self.h, HARNESS_KEYS), ("server", self.s, SERVER_KEYS)):
+            for k, v in (cp.items(sect) if cp.has_section(sect) else []):
+                if k not in known:
+                    say(paint("33", "warning: unknown key '%s' in [%s] of %s" % (k, sect, path)))
+                if v.strip():
+                    store[k] = v.strip()
+        if "dir" in self.h:
+            self.h["dir"] = str(self.rel(self.h["dir"]))
+        cmd = self.s.get("command")
+        if cmd and self.s.get("type", "llama.cpp") != "custom" and ("/" in cmd or "\\" in cmd):
+            self.s["command"] = str(self.rel(cmd))
+        if "log" in self.s:
+            self.s["log"] = str(self.rel(self.s["log"]))
+        m = self.s.get("model")
+        if m and self.rel(m).exists():      # a file path; otherwise e.g. an Ollama model name
+            self.s["model"] = str(self.rel(m))
+
+    def rel(self, p):
+        p = Path(p).expanduser()
+        return p if p.is_absolute() else (self.base / p)
+
+    @staticmethod
+    def find(explicit=None):
+        if explicit or os.environ.get("MINIHARNESS_CONFIG"):
+            path = Path(explicit or os.environ["MINIHARNESS_CONFIG"]).expanduser()
+            if not path.is_file():
+                sys.exit("config file not found: %s" % path)
+            return Config(path.resolve())
+        for d in (Path.cwd(), Path(__file__).resolve().parent):
+            if (d / CONFIG_NAME).is_file():
+                return Config((d / CONFIG_NAME).resolve())
+        return Config(None)
+
+
+def server_settings(conf, url, ctx, protocol):
+    """Resolved [server] settings, or None when miniharness should not start a server."""
+    s = conf.s
+    try:
+        if not _bool(s.get("start", "false")):
+            return None
+    except ValueError:
+        sys.exit("[server] start must be true or false")
+    kind = s.get("type", "llama.cpp").lower().replace("llamacpp", "llama.cpp")
+    if kind not in ("llama.cpp", "ollama", "custom"):
+        sys.exit("[server] type must be llama.cpp, ollama or custom")
+    u = urllib.parse.urlparse(url) if url else None
+    port = _int(s.get("port"), 0) or (u and u.port) or (11434 if kind == "ollama" else 8080)
+    host = s.get("host", "127.0.0.1")
+    return {"type": kind, "command": s.get("command", ""), "model": s.get("model", ""),
+            "hf_repo": s.get("hf_repo", ""), "host": host, "port": port,
+            "connect_host": "127.0.0.1" if host in ("0.0.0.0", "::", "") else host,
+            "args": split_cmd(s.get("args", "")), "timeout": _int(s.get("timeout"), 180),
+            "log": s.get("log") or str(conf.base / "miniharness-server.log"),
+            "ctx": ctx, "protocol": protocol}
+
+
+def server_command(c):
+    """-> (argv, extra environment) for the configured server."""
+    kind, extra = c["type"], c["args"]
+    if kind == "ollama":
+        env = {"OLLAMA_HOST": "%s:%d" % (c["host"], c["port"]), "OLLAMA_CONTEXT_LENGTH": str(c["ctx"])}
+        return [c["command"] or "ollama", "serve"] + extra, env
+    if kind == "custom":
+        if not c["command"]:
+            sys.exit("[server] type = custom needs command")
+        cmd = c["command"]
+        for k in ("host", "port", "ctx"):
+            cmd = cmd.replace("{%s}" % k, str(c[k]))
+        return split_cmd(cmd) + extra, {}
+    argv = [c["command"] or "llama-server"]
+    if c["hf_repo"]:
+        argv += ["-hf", c["hf_repo"]]
+    elif c["model"]:
+        argv += ["-m", c["model"]]
+    else:
+        sys.exit("[server] set model (path to a .gguf file) or hf_repo")
+    argv += ["-c", str(c["ctx"]), "--host", c["host"], "--port", str(c["port"])]
+    if c["protocol"] == "native" and "--jinja" not in extra:
+        argv.append("--jinja")
+    if not {"-np", "--parallel"} & set(extra):
+        argv += ["-np", "1"]            # one slot: the whole -c belongs to us
+    return argv + extra, {}
+
+
+class ServerProc:
+    """Starts the configured server (unless one already listens) and stops it on exit."""
+
+    def __init__(self, c):
+        self.c, self.proc, self.log = c, None, None
+
+    def listening(self):
+        try:
+            socket.create_connection((self.c["connect_host"], self.c["port"]), timeout=1).close()
+            return True
+        except OSError:
+            return False
+
+    def tail(self, n=15):
+        try:
+            self.log.flush()
+            with open(self.c["log"], encoding="utf-8", errors="replace") as f:
+                return "".join(f.readlines()[-n:])
+        except (OSError, ValueError, AttributeError):
+            return ""
+
+    def ensure(self, client):
+        c = self.c
+        if self.listening():
+            say(dim("server already running on port %d, using it (its own settings apply)" % c["port"]))
+            return
+        argv, extra_env = server_command(c)
+        say(dim("starting server: " + " ".join(argv)))
+        kw = {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)} if os.name == "nt" \
+            else {"start_new_session": True}   # own group: Ctrl+C in our terminal must not hit it
+        try:
+            self.log = open(c["log"], "w", encoding="utf-8")
+            self.proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=self.log,
+                                         stderr=subprocess.STDOUT, env=dict(os.environ, **extra_env), **kw)
+        except OSError as e:
+            sys.exit("cannot start '%s': %s\nSet [server] command to the full path of the executable."
+                     % (argv[0], e.strerror or e))
+        atexit.register(self.stop)
+        deadline = time.time() + c["timeout"]
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                sys.exit("server exited with code %s. Last log lines (%s):\n%s" %
+                         (self.proc.returncode, c["log"], self.tail()))
+            if client._json(client.base + "/models") is not None:
+                say(dim("server ready (log: %s)" % c["log"]))
+                return
+            time.sleep(0.5)
+        self.stop()
+        sys.exit("server did not answer within %ds (log: %s)\n%s" % (c["timeout"], c["log"], self.tail()))
+
+    def stop(self):
+        p, self.proc = self.proc, None
+        if p is None or p.poll() is not None:
+            return
+        try:
+            if os.name == "nt":     # also kills child processes (e.g. Ollama runners)
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                os.killpg(p.pid, signal.SIGTERM)
+            p.wait(timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            p.kill()
+        if self.log:
+            self.log.close()
+
+
 # --------------------------------------------------------------------- cli
 HELP = """\
 /ctx [n]    show / set context window (tokens)
@@ -755,36 +995,92 @@ def read_input():
 
 def parse_args(argv=None):
     env = os.environ.get
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config")
+    conf = Config.find(pre.parse_known_args(argv)[0].config)
+
+    def d(envname, key, builtin, conv=str):
+        for v in (env(envname) if envname else None, conf.h.get(key)):
+            if v not in (None, ""):
+                try:
+                    return conv(v)
+                except ValueError:
+                    sys.exit("bad value for '%s': %s" % (key, v))
+        return builtin
+
     ap = argparse.ArgumentParser(
         prog="miniharness",
-        description="Small agent harness for local LLMs (llama.cpp / OpenAI-compatible API).")
-    ap.add_argument("-d", "--dir", default=".", help="project folder the model may read/edit (default: .)")
-    ap.add_argument("-u", "--url", default=env("MINIHARNESS_URL", DEFAULT_URL),
+        description="Small agent harness for local LLMs (llama.cpp, Ollama, OpenAI-compatible APIs).")
+    ap.add_argument("--config", help="config file (default: %s in the current folder or next to the script)"
+                    % CONFIG_NAME)
+    ap.add_argument("--init", action="store_true", help="write a template %s here and exit" % CONFIG_NAME)
+    ap.add_argument("--no-server", action="store_true", help="don't start the server from the config")
+    ap.add_argument("-d", "--dir", default=d(None, "dir", "."), help="project folder the model may read/edit (default: .)")
+    ap.add_argument("-u", "--url", default=d("MINIHARNESS_URL", "url", ""),
                     help="OpenAI-compatible base URL (default: %s)" % DEFAULT_URL)
-    ap.add_argument("-m", "--model", default=env("MINIHARNESS_MODEL", ""), help="model name (optional for llama.cpp)")
-    ap.add_argument("--api-key", default=env("MINIHARNESS_API_KEY", env("OPENAI_API_KEY", "")))
-    ap.add_argument("-c", "--ctx", type=int, default=_int(env("MINIHARNESS_CTX"), 0),
-                    help="context window in tokens; default: read from server (/props), else %d" % DEFAULT_CTX)
-    ap.add_argument("--max-tokens", type=int, default=0,
+    ap.add_argument("-m", "--model", default=d("MINIHARNESS_MODEL", "model", ""),
+                    help="model name (optional for llama.cpp)")
+    ap.add_argument("--api-key", default=d("MINIHARNESS_API_KEY", "api_key", env("OPENAI_API_KEY", "")))
+    ap.add_argument("-c", "--ctx", type=int, default=d("MINIHARNESS_CTX", "ctx", 0, int),
+                    help="context window in tokens; default: read from server, else %d" % DEFAULT_CTX)
+    ap.add_argument("--max-tokens", type=int, default=d(None, "max_tokens", 0, int),
                     help="tokens reserved for one reply (default: ctx/4, 256..2048)")
-    ap.add_argument("--protocol", choices=["native", "text"], default="native",
+    ap.add_argument("--protocol", choices=["native", "text"], default=d(None, "protocol", "native"),
                     help="native: OpenAI tool calls (llama-server --jinja); text: plain-text tool protocol")
-    ap.add_argument("--temperature", type=float, default=0.2)
-    ap.add_argument("--max-steps", type=int, default=20, help="max tool rounds per message")
+    ap.add_argument("--temperature", type=float, default=d(None, "temperature", 0.2, float))
+    ap.add_argument("--max-steps", type=int, default=d(None, "max_steps", 20, int), help="max tool rounds per message")
     ap.add_argument("--no-summary", dest="summarize", action="store_false",
+                    default=d(None, "summarize", True, _bool),
                     help="drop old messages without summarizing them")
-    ap.add_argument("-y", "--yes", action="store_true", help="apply file changes without asking")
+    ap.add_argument("-y", "--yes", action="store_true", default=d(None, "auto_approve", False, _bool),
+                    help="apply file changes without asking")
     ap.add_argument("-p", "--prompt", help="run a single prompt and exit")
-    return ap.parse_args(argv)
+    args = ap.parse_args(argv)
+    args.conf = conf
+    return args
 
 
 def main(argv=None):
     args = parse_args(argv)
     Term.setup()
+    if args.init:
+        target = Path(CONFIG_NAME)
+        if target.exists():
+            sys.exit("%s already exists" % target)
+        target.write_text(TEMPLATE, encoding="utf-8")
+        say("created %s - edit it (model path!), then just run: python %s" %
+            (target, Path(sys.argv[0]).name))
+        return
+    srv = None
+    if not args.no_server:
+        srv = server_settings(args.conf, args.url, args.ctx or DEFAULT_CTX, args.protocol)
+    if srv:
+        args.ctx = args.ctx or DEFAULT_CTX      # the server and the harness must agree on one size
+        args.url = args.url or "http://%s:%d/v1" % (srv["connect_host"], srv["port"])
+        if srv["type"] == "ollama":
+            args.model = args.model or srv["model"]
+    args.url = args.url or DEFAULT_URL
+    if args.conf.path:
+        say(dim("config: %s" % args.conf.path))
     root = Path(args.dir)
     if not root.is_dir():
         sys.exit("not a folder: %s" % args.dir)
     client = Client(args.url, args.api_key, args.model)
+    if srv:
+        proc = ServerProc(srv)
+        for sig in ("SIGTERM", "SIGHUP"):   # make atexit cleanup run on termination too
+            if hasattr(signal, sig):
+                signal.signal(getattr(signal, sig), lambda *_: sys.exit(143))
+        try:
+            proc.ensure(client)
+            run(args, client, root)
+        finally:
+            proc.stop()
+    else:
+        run(args, client, root)
+
+
+def run(args, client, root):
 
     if not args.model:
         client.model = client.pick_model() or client.model

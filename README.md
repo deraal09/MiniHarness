@@ -17,6 +17,45 @@ python miniharness.py --dir ./mein-ordner
 
 Windows: `py miniharness.py --dir C:\pfad\ordner` (Port, URL usw. wie unten).
 
+## Config-Datei: Server automatisch starten
+
+```bash
+python miniharness.py --init      # legt eine kommentierte miniharness.ini an
+# ini anpassen (mindestens [server] model = Pfad/zur/datei.gguf), dann nur noch:
+python miniharness.py
+```
+
+Die Datei wird in dieser Reihenfolge gesucht: `--config PFAD`, `MINIHARNESS_CONFIG`, aktueller Ordner,
+Ordner des Skripts. Relative Pfade in der Datei gelten relativ zur Datei. Vorrang: Kommandozeile >
+Umgebungsvariable (`MINIHARNESS_*`) > Config.
+
+```ini
+[harness]
+dir = .
+ctx = 8192            ; gilt für Harness UND den gestarteten Server
+protocol = native
+
+[server]
+start = true
+type = llama.cpp      ; llama.cpp | ollama | custom
+model = C:\modelle\qwen.gguf     ; oder hf_repo = Org/Repo-GGUF
+port = 8080
+args = --n-gpu-layers 99
+```
+
+- **llama.cpp:** gestartet wird `llama-server -m … -c <ctx> --host … --port … --jinja -np 1 <args>`
+  (`--jinja` nur bei `protocol = native`; `-np 1`, damit das ganze Fenster dem Harness gehört).
+  Liegt `llama-server` nicht im PATH, `command = /voller/pfad/llama-server` setzen.
+- **Ollama:** `ollama serve` mit `OLLAMA_CONTEXT_LENGTH=<ctx>` und `OLLAMA_HOST`; `model` ist der Modellname
+  (vorher `ollama pull`).
+- **custom:** beliebiger Befehl in `command`, `{host}`, `{port}`, `{ctx}` werden ersetzt.
+- Lauscht auf dem Port schon ein Server, wird dieser benutzt und nicht neu gestartet (dann gelten
+  dessen Einstellungen). Der selbst gestartete Server wird beim Beenden wieder gestoppt
+  (Strg+C bricht nur die laufende Antwort ab, nicht den Server). Wer den Server dauerhaft laufen
+  lassen will, startet ihn einfach selbst.
+- Serverausgabe steht in `miniharness-server.log`; startet der Server nicht, werden die letzten Zeilen gezeigt.
+- `--no-server` ignoriert den `[server]`-Abschnitt. Für Zugriff aus dem Netz `host = 0.0.0.0` setzen.
+
 ## Server im lokalen Netzwerk
 
 Das Modell kann auf einem anderen Rechner laufen:

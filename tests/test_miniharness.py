@@ -203,5 +203,64 @@ class EndToEnd(Base):
         self.assertNotIn("tools", FakeLLM.requests[0])
 
 
+class ConfigTests(Base):
+    def write_ini(self, text):
+        path = self.root / "miniharness.ini"
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+
+    def test_precedence_and_relative_dir(self):
+        ini = self.write_ini("[harness]\ndir = work\nctx = 3000\nprotocol = text\nauto_approve = true\n")
+        a = mh.parse_args(["--config", ini])
+        self.assertEqual((a.ctx, a.protocol, a.yes), (3000, "text", True))
+        self.assertEqual(Path(a.dir), self.root.resolve() / "work")
+        self.assertEqual(mh.parse_args(["--config", ini, "--ctx", "999"]).ctx, 999)
+
+    def test_server_command(self):
+        def cmd(body, ctx=4096, proto="native", url=""):
+            conf = mh.Config(Path(self.write_ini(body)))
+            return mh.server_command(mh.server_settings(conf, url, ctx, proto))
+        argv, env = cmd("[server]\nstart = true\nmodel = m.gguf\nargs = --n-gpu-layers 99\n", ctx=8192)
+        self.assertEqual(argv, ["llama-server", "-m", "m.gguf", "-c", "8192", "--host", "127.0.0.1",
+                                "--port", "8080", "--jinja", "-np", "1", "--n-gpu-layers", "99"])
+        argv, _ = cmd("[server]\nstart = true\nhf_repo = a/b\n", proto="text", url="http://x:9000/v1")
+        self.assertIn("-hf", argv)
+        self.assertNotIn("--jinja", argv)
+        self.assertEqual(argv[argv.index("--port") + 1], "9000")
+        argv, env = cmd("[server]\nstart = true\ntype = ollama\nhost = 0.0.0.0\n", ctx=6000)
+        self.assertEqual(argv, ["ollama", "serve"])
+        self.assertEqual(env, {"OLLAMA_HOST": "0.0.0.0:11434", "OLLAMA_CONTEXT_LENGTH": "6000"})
+        argv, _ = cmd("[server]\nstart = true\ntype = custom\ncommand = srv --p {port} -c {ctx}\n")
+        self.assertEqual(argv, ["srv", "--p", "8080", "-c", "4096"])
+        self.assertIsNone(mh.server_settings(mh.Config(Path(self.write_ini("[server]\nstart = false\n"))),
+                                             "", 1, "native"))
+
+    def test_start_and_stop_server(self):
+        import socket
+        with socket.socket() as sk:
+            sk.bind(("127.0.0.1", 0))
+            port = sk.getsockname()[1]
+        script = self.root / "fake_server.py"
+        script.write_text("import sys, json\nfrom http.server import HTTPServer, BaseHTTPRequestHandler\n"
+                          "class H(BaseHTTPRequestHandler):\n"
+                          "    def do_GET(self):\n"
+                          "        self.send_response(200); self.end_headers()\n"
+                          "        self.wfile.write(json.dumps({'data': [{'id': 'm'}]}).encode())\n"
+                          "    def log_message(self, *a): pass\n"
+                          "HTTPServer(('127.0.0.1', int(sys.argv[1])), H).serve_forever()\n")
+        conf = mh.Config(Path(self.write_ini("[server]\nstart = true\ntype = custom\ncommand = \"%s\" \"%s\" {port}\n"
+                                             "timeout = 30\nlog = srv.log\n" % (sys.executable, script))))
+        srv = mh.ServerProc(mh.server_settings(conf, "", 4096, "native"))
+        srv.c["port"] = port
+        srv.c["command"] = '"%s" "%s" %d' % (sys.executable, script, port)
+        client = mh.Client("http://127.0.0.1:%d/v1" % port)
+        self.addCleanup(srv.stop)
+        srv.ensure(client)
+        self.assertEqual(client.pick_model(), "m")
+        self.assertTrue(srv.listening())
+        srv.stop()
+        self.assertFalse(srv.listening())
+
+
 if __name__ == "__main__":
     unittest.main()
