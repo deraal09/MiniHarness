@@ -76,6 +76,24 @@ Ordner wie `.git`/`node_modules` werden ausgelassen).
   angehängten Dateien). Ist eine Datei größer, steht am Ende `start_line=N` – das Modell liest dann gezielt weiter.
 - Im `-p`-Modus werden nur exakte Pfade aufgelöst (keine Rückfragen).
 
+## Zeitanzeige
+
+Solange das Modell arbeitet, ohne dass schon Text erscheint (Prompt wird verarbeitet, ein langer Tool-Aufruf wird
+aufgebaut, alte Nachrichten werden zusammengefasst), läuft eine Live-Zeile mit der verstrichenen Zeit:
+
+```
+· 12.4s  waiting for model
+```
+
+Sobald die Antwort gestreamt wird, verschwindet die Zeile. Nach jeder Nachricht steht die Gesamtdauer in der Statuszeile:
+
+```
+[context 1834/8192 · 22% · 14.8s (prompt 9.6s, 18.2 tok/s) · CPU 41% · GPU 93% peak, VRAM 6.1/12.0 GB]
+```
+
+`prompt` = Wartezeit bis zum ersten Token, `tok/s` = Erzeugungsgeschwindigkeit. Wartezeit auf Ihre Bestätigung von
+Dateiänderungen wird nicht mitgezählt. Ohne Terminal (Ausgabe in Datei/Pipe) gibt es keine Live-Zeile, nur die Statuszeile.
+
 ## CPU- und GPU-Anzeige
 
 Beim Start zeigt das Harness die erkannte Hardware (CPU-Modell/Threads, GPU). Nach jeder Antwort steht in der

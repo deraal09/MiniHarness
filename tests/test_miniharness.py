@@ -1,7 +1,10 @@
+import contextlib
+import io
 import json
 import os
 import sys
 import tempfile
+import time
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -15,6 +18,7 @@ class FakeLLM(BaseHTTPRequestHandler):
     script = []      # replies, popped in order: {"content": str} or {"tool": (name, args)}
     requests = []
     n_ctx = 2048
+    delay = 0.0      # seconds before the first token
     ollama = False   # behave like Ollama: no /props, /api/ps + /v1/models, tool calls without index
 
     def log_message(self, *a):
@@ -46,6 +50,7 @@ class FakeLLM(BaseHTTPRequestHandler):
         chunks = [{"choices": [{"delta": delta, "finish_reason": None}]},
                   {"choices": [{"delta": {}, "finish_reason": "stop"}]},
                   {"choices": [], "usage": {"prompt_tokens": 100, "completion_tokens": 10}}]
+        time.sleep(self.delay)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
@@ -191,6 +196,15 @@ class EndToEnd(Base):
         self.assertEqual(FakeLLM.requests[1]["messages"][-1]["role"], "tool")
         self.assertEqual(a.msgs[-1]["content"], "done")
         self.assertEqual(a.used, 110)
+
+    def test_perf_stats(self):
+        FakeLLM.delay = 0.3
+        self.addCleanup(setattr, FakeLLM, "delay", 0.0)
+        FakeLLM.script = [{"content": "hi"}]
+        a = mh.Agent(mh.parse_args(["--dir", str(self.root)]), mh.Client(self.url), self.tools, 2048)
+        a.run_turn("hello")
+        self.assertGreaterEqual(a.perf["prompt_s"], 0.25)
+        self.assertIn("prompt 0.", a.perf_text())
 
     def test_tool_loop_text(self):
         (self.root / "n.txt").write_text("abc\n")
@@ -355,6 +369,39 @@ class MentionTests(Base):
         self.assertIn("main.py", out)                      # folder -> listing
         self.assertIn("ERROR: no such file", out)
         self.assertLess(len(out), 1800)
+
+
+class TimerTests(Base):
+    def test_ticker_live_line_and_pause(self):
+        buf = io.StringIO()
+        tk = mh.Ticker(live=True)
+        with contextlib.redirect_stdout(buf):
+            tk.start()
+            tk.phase("waiting for model")
+            time.sleep(0.45)
+            tk.pause()
+            time.sleep(0.3)             # user thinking: must not count
+            tk.resume()
+            tk.phase("")
+            secs = tk.stop()
+        out = buf.getvalue()
+        self.assertIn("waiting for model", out)
+        self.assertTrue(out.endswith("\r\033[K"))        # line erased again
+        self.assertTrue(0.4 < secs < 0.7, secs)
+
+    def test_ticker_silent_without_tty(self):
+        buf = io.StringIO()
+        tk = mh.Ticker(live=False)
+        with contextlib.redirect_stdout(buf):
+            tk.start()
+            tk.phase("waiting for model")
+            time.sleep(0.3)
+            tk.stop()
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_fmt_and_perf(self):
+        self.assertEqual(mh.fmt_secs(3.14), "3.1s")
+        self.assertEqual(mh.fmt_secs(125), "2m 05s")
 
 
 if __name__ == "__main__":

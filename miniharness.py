@@ -400,7 +400,7 @@ class Client:
             return int(found.group(1)), "Ollama model parameters"
         return None, None
 
-    def chat(self, messages, tools, max_tokens, temperature, on_text=None, on_think=None):
+    def chat(self, messages, tools, max_tokens, temperature, on_text=None, on_think=None, on_chunk=None):
         body = {"model": self.model, "messages": messages, "max_tokens": max_tokens,
                 "temperature": temperature, "stream": True,
                 "stream_options": {"include_usage": True}}
@@ -425,6 +425,8 @@ class Client:
                 usage = ev.get("usage") or usage
                 for ch in ev.get("choices") or []:
                     d = ch.get("delta") or {}
+                    if on_chunk and (d.get("content") or d.get("reasoning_content") or d.get("tool_calls")):
+                        on_chunk()
                     if d.get("reasoning_content") and on_think:
                         on_think(d["reasoning_content"])
                     if d.get("content"):
@@ -446,6 +448,87 @@ class Client:
         return {"content": "".join(content), "calls": [calls[k] for k in sorted(calls)],
                 "finish": finish, "prompt_tokens": usage.get("prompt_tokens"),
                 "completion_tokens": usage.get("completion_tokens")}
+
+
+# ------------------------------------------------------------------ timer
+def fmt_secs(t):
+    return "%.1fs" % t if t < 60 else "%dm %02ds" % (t // 60, t % 60)
+
+
+class Ticker:
+    """Times a turn (user waiting time excluded) and shows a live line while nothing else is
+    on screen, i.e. while the model works its way through the prompt or builds a tool call."""
+
+    def __init__(self, live=None):
+        self.live = sys.stdout.isatty() if live is None else live
+        self.lock = threading.Lock()
+        self.label, self.t0, self.paused_s, self.pause_at = "", None, 0.0, None
+        self.shown, self.stopper, self.thread = False, threading.Event(), None
+
+    def elapsed(self):
+        if self.t0 is None:
+            return 0.0
+        now = self.pause_at or time.time()
+        return now - self.t0 - self.paused_s
+
+    def start(self):
+        self.t0, self.paused_s, self.pause_at, self.label = time.time(), 0.0, None, ""
+        self.stopper.clear()
+        if self.live:
+            self.thread = threading.Thread(target=self.loop, daemon=True)
+            self.thread.start()
+
+    def loop(self):
+        while not self.stopper.wait(0.2):
+            with self.lock:
+                self.draw()
+
+    def draw(self):
+        if self.live and self.label and self.pause_at is None:
+            sys.stdout.write("\r" + dim("· %s  %s" % (fmt_secs(self.elapsed()), self.label)) + "\033[K")
+            sys.stdout.flush()
+            self.shown = True
+
+    def erase(self):
+        if self.shown:
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+            self.shown = False
+
+    def phase(self, label):
+        """Set what we are waiting for; '' = something else owns the screen (hides the line)."""
+        if self.t0 is None:
+            return
+        with self.lock:
+            self.label = label
+            if label:
+                self.draw()
+            else:
+                self.erase()
+
+    def pause(self):
+        """Stop counting and drawing while the user is asked something."""
+        if self.t0 is not None and self.pause_at is None:
+            with self.lock:
+                self.erase()
+                self.pause_at = time.time()
+
+    def resume(self):
+        if self.t0 is not None and self.pause_at is not None:
+            self.paused_s += time.time() - self.pause_at
+            self.pause_at = None
+
+    def stop(self):
+        """-> active seconds of the turn."""
+        if self.thread:
+            self.stopper.set()
+            self.thread.join(timeout=2)
+            self.thread = None
+        with self.lock:
+            self.erase()
+        t = self.elapsed()
+        self.t0 = None
+        return t
 
 
 # ------------------------------------------------------------------- agent
@@ -516,6 +599,8 @@ class Agent:
         self.ratio = 3.0            # chars per token, calibrated from server usage
         self.used = 0               # tokens of the last request (prompt + reply)
         self.ctx_guess = False      # n_ctx is only a default guess -> ask the server after 1st reply
+        self.ticker = Ticker(live=False)
+        self.perf = {"prompt_s": 0.0, "gen_s": 0.0, "tokens": 0}   # per turn: prompt wait, generation
         self.tool_json = json.dumps(TOOL_SPECS, separators=(",", ":")) if self.native else ""
 
     # -- sizes
@@ -615,6 +700,7 @@ class Agent:
         prompt = ("Notes so far:\n%s\n\nNew events:\n%s\n\nRewrite the notes so they include the new events. "
                   "Max 150 words: user goal, files read/changed and how, open tasks, key facts. "
                   "Output only the notes." % (self.summary or "(none)", text))
+        self.ticker.phase("summarizing old messages")
         try:
             res = self.client.chat(
                 [{"role": "system", "content": "You compress conversation history into short notes."},
@@ -637,26 +723,49 @@ class Agent:
 
     # -- model call
     def call(self):
+        try:
+            return self.call_once()
+        finally:
+            self.ticker.phase("")
+
+    def call_once(self):
         for attempt in range(3):
+            self.ticker.phase("waiting for model")
             self.fit()
+            self.ticker.phase("waiting for model")      # fit() may have shown "summarizing"
             payload = [{"role": "system", "content": self.system()}] + \
                 [{k: v for k, v in m.items() if not k.startswith("_")} for m in self.msgs]
             sent = self.chars(self.msgs)
             started = [False]
+            t = {"start": time.time(), "first": None}
 
-            def on_text(t):
+            def on_chunk():
+                if t["first"] is None:
+                    t["first"] = time.time()
+
+            def on_text(piece):
+                self.ticker.phase("")
                 started[0] = True
-                say(t, end="")
+                say(piece, end="")
+
+            def on_think(piece):
+                self.ticker.phase("")
+                say(dim(piece), end="")
 
             try:
                 res = self.client.chat(payload, TOOL_SPECS if self.native else None, self.reserve,
-                                       self.a.temperature, on_text, lambda t: say(dim(t), end=""))
+                                       self.a.temperature, on_text, on_think, on_chunk)
             except LLMError as e:
                 if e.is_context and attempt < 2:
                     self.n_ctx = int(self.n_ctx * 0.75)
                     say(dim("[server rejected the size, assuming context %d]" % self.n_ctx))
                     continue
                 raise
+            end = time.time()
+            first = t["first"] or end
+            self.perf["prompt_s"] += first - t["start"]
+            self.perf["gen_s"] += end - first
+            self.perf["tokens"] += res["completion_tokens"] or 0
             if started[0]:
                 say()
             if self.ctx_guess:
@@ -672,6 +781,15 @@ class Agent:
             else:
                 self.used = self.est()
             return res
+
+    def perf_text(self):
+        p = self.perf
+        out = ""
+        if p["prompt_s"] >= 0.05:
+            out += "prompt %s" % fmt_secs(p["prompt_s"])
+        if p["tokens"] and p["gen_s"] > 0.05:
+            out += (", " if out else "") + "%.1f tok/s" % (p["tokens"] / p["gen_s"])
+        return out
 
     def execute(self, c):
         if c.get("error"):
@@ -693,6 +811,7 @@ class Agent:
         return out
 
     def run_turn(self, text):
+        self.perf = {"prompt_s": 0.0, "gen_s": 0.0, "tokens": 0}
         self.msgs.append({"role": "user", "content": text})
         try:
             for _ in range(self.a.max_steps):
@@ -1393,20 +1512,27 @@ def run(args, client, root):
 
     state = {"auto": args.yes}
 
+    ticker = Ticker()
+
     def confirm(title, preview):
-        say(paint("36", title))
-        say(preview)
-        if state["auto"]:
-            return True
+        ticker.pause()                  # waiting for the user doesn't count
         try:
-            ans = input("apply? [y/N/a=always] ").strip().lower()
-        except EOFError:
-            return False
-        if ans in ("a", "always"):
-            state["auto"] = True
-        return ans in ("y", "yes", "j", "ja", "a", "always")
+            say(paint("36", title))
+            say(preview)
+            if state["auto"]:
+                return True
+            try:
+                ans = input("apply? [y/N/a=always] ").strip().lower()
+            except EOFError:
+                return False
+            if ans in ("a", "always"):
+                state["auto"] = True
+            return ans in ("y", "yes", "j", "ja", "a", "always")
+        finally:
+            ticker.resume()
 
     agent = Agent(args, client, None, n_ctx)
+    agent.ticker = ticker
     agent.tools = Tools(root, confirm, agent.tool_cap)
     say(paint("1", "miniharness") + dim(" · %s · model %s · folder %s · context %d tokens (%s) · reply reserve %d" %
                                         (args.url, client.model, agent.tools.root, n_ctx, src, agent.reserve)))
@@ -1438,12 +1564,20 @@ def run(args, client, root):
             text += attach_text(agent.tools, rels, int(agent.n_ctx * agent.ratio * 0.35))
         return text
 
-    if args.prompt:
+    def timed_turn(text):
+        """Run one turn with live timer and load sampling; -> status text (time, speed, CPU/GPU)."""
+        ticker.start()
         mon.start()
         try:
-            agent.run_turn(compose(args.prompt, None))
+            agent.run_turn(text)
         finally:
-            say(dim("[%s]" % mon.stop()))
+            load = mon.stop()
+            secs = ticker.stop()
+        perf = agent.perf_text()
+        return " · ".join(x for x in (fmt_secs(secs) + (" (%s)" % perf if perf else ""), load) if x)
+
+    if args.prompt:
+        say(dim("[%s]" % timed_turn(compose(args.prompt, None))))
         return
     setup_completion(files)
     names = files()
@@ -1504,13 +1638,9 @@ def run(args, client, root):
         except KeyboardInterrupt:
             say(dim("\n(cancelled)"))
             continue
-        mon.start()
-        try:
-            agent.run_turn(line)
-        finally:
-            load = mon.stop()
-        say(dim("[context %d/%d · %d%%%s]" % (agent.used, agent.n_ctx, 100 * agent.used // max(1, agent.n_ctx),
-                                              " · " + load if load else "")))
+        stats = timed_turn(line)
+        say(dim("[context %d/%d · %d%% · %s]" % (agent.used, agent.n_ctx,
+                                                100 * agent.used // max(1, agent.n_ctx), stats)))
 
 
 if __name__ == "__main__":
