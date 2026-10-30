@@ -12,12 +12,15 @@ import difflib
 import ipaddress
 import json
 import os
+import platform
 import re
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -359,6 +362,15 @@ class Client:
         """First model the server lists (needed by Ollama; llama.cpp ignores the name)."""
         data = (self._json(self.base + "/models") or {}).get("data") or []
         return data[0].get("id", "") if data and isinstance(data[0], dict) else ""
+
+    def ollama_gpu(self):
+        """Share of the loaded Ollama model that sits in GPU memory (0-100), or None."""
+        u = urllib.parse.urlparse(self.base)
+        name = self.model.split(":")[0]
+        for m in (self._json("%s://%s/api/ps" % (u.scheme, u.netloc)) or {}).get("models") or []:
+            if str(m.get("name", "")).split(":")[0] == name and m.get("size"):
+                return 100.0 * (m.get("size_vram") or 0) / m["size"]
+        return None
 
     def server_ctx(self):
         """(context tokens, source) the server really runs with, or (None, None).
@@ -743,7 +755,7 @@ CONFIG_NAME = "miniharness.ini"
 HARNESS_KEYS = {"dir", "url", "model", "api_key", "ctx", "max_tokens", "protocol",
                 "temperature", "max_steps", "summarize", "auto_approve"}
 SERVER_KEYS = {"start", "type", "command", "model", "hf_repo", "host", "port", "args",
-               "timeout", "log"}
+               "timeout", "log", "gpu_layers", "threads"}
 
 TEMPLATE = """\
 # miniharness configuration. Lines starting with # or ; are comments
@@ -784,7 +796,11 @@ model = /path/to/model.gguf
 hf_repo =
 host = 127.0.0.1
 port = 8080
-# Extra arguments, e.g. --n-gpu-layers 99 --flash-attn on
+# llama.cpp only. gpu_layers: empty = llama.cpp decides, all = everything on the GPU,
+# 0 = CPU only, N = N layers on the GPU (the rest runs on the CPU). threads: CPU threads (empty = auto).
+gpu_layers =
+threads =
+# Extra arguments, e.g. --flash-attn on
 args =
 # Seconds to wait until the server answers (loading big models takes a while).
 timeout = 180
@@ -871,6 +887,7 @@ def server_settings(conf, url, ctx, protocol):
     return {"type": kind, "command": s.get("command", ""), "model": s.get("model", ""),
             "hf_repo": s.get("hf_repo", ""), "host": host, "port": port,
             "connect_host": "127.0.0.1" if host in ("0.0.0.0", "::", "") else host,
+            "gpu_layers": s.get("gpu_layers", "").lower(), "threads": s.get("threads", ""),
             "args": split_cmd(s.get("args", "")), "timeout": _int(s.get("timeout"), 180),
             "log": s.get("log") or str(conf.base / "miniharness-server.log"),
             "ctx": ctx, "protocol": protocol}
@@ -901,6 +918,15 @@ def server_command(c):
         argv.append("--jinja")
     if not {"-np", "--parallel"} & set(extra):
         argv += ["-np", "1"]            # one slot: the whole -c belongs to us
+    gl = c["gpu_layers"]
+    if gl and not {"-ngl", "--gpu-layers", "--n-gpu-layers"} & set(extra):
+        if gl != "all" and not gl.isdigit():
+            sys.exit("[server] gpu_layers must be empty, all or a number")
+        argv += ["-ngl", "999" if gl == "all" else gl]
+    if c["threads"] and not {"-t", "--threads"} & set(extra):
+        if not c["threads"].isdigit():
+            sys.exit("[server] threads must be a number")
+        argv += ["-t", c["threads"]]
     return argv + extra, {}
 
 
@@ -949,6 +975,12 @@ class ServerProc:
                          (self.proc.returncode, c["log"], self.tail()))
             if client._json(client.base + "/models") is not None:
                 say(dim("server ready (log: %s)" % c["log"]))
+                info = offload_info(self.tail(400))
+                if info:
+                    say(dim("  " + info))
+                    if re.search(r"offloaded 0/", info) and c["gpu_layers"] != "0" and gpu_info():
+                        say(paint("33", "warning: a GPU exists but the model runs on the CPU. "
+                                        "Is this llama.cpp build CPU-only? (CUDA/Vulkan build needed)"))
                 return
             time.sleep(0.5)
         self.stop()
@@ -971,12 +1003,155 @@ class ServerProc:
             self.log.close()
 
 
+# ---------------------------------------------------------------- hardware
+def _quiet():
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {}
+
+
+def parse_nvidia(text):
+    """nvidia-smi csv (name, mem.used, mem.total, util) -> list of dicts."""
+    gpus = []
+    for line in text.strip().splitlines():
+        f = [x.strip() for x in line.split(",")]
+        try:
+            gpus.append({"name": f[0], "used": float(f[1]), "total": float(f[2]),
+                         "util": float(f[3]) if f[3].replace(".", "").isdigit() else None})
+        except (IndexError, ValueError):
+            continue
+    return gpus
+
+
+def gpu_info():
+    """NVIDIA GPUs via nvidia-smi; [] when there is none (AMD/Intel/Apple: no live numbers)."""
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        return []
+    try:
+        out = subprocess.run([exe, "--query-gpu=name,memory.used,memory.total,utilization.gpu",
+                              "--format=csv,noheader,nounits"], capture_output=True, text=True,
+                             timeout=5, **_quiet()).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return parse_nvidia(out)
+
+
+def cpu_name():
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as f:
+            for ln in f:
+                if ln.lower().startswith("model name"):
+                    return ln.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    if sys.platform == "darwin":
+        try:
+            return subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True,
+                                  text=True, timeout=3).stdout.strip() or platform.processor()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return platform.processor() or platform.machine()
+
+
+def apple_silicon():
+    return sys.platform == "darwin" and platform.machine() == "arm64"
+
+
+def cpu_sample():
+    """(idle, total) system-wide CPU time counters, or None if the OS gives none (stdlib only)."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            idle, kern, user = wintypes.FILETIME(), wintypes.FILETIME(), wintypes.FILETIME()
+            if not ctypes.windll.kernel32.GetSystemTimes(
+                    ctypes.byref(idle), ctypes.byref(kern), ctypes.byref(user)):
+                return None
+
+            def t(f):
+                return (f.dwHighDateTime << 32) | f.dwLowDateTime
+            return t(idle), t(kern) + t(user)       # kernel time includes idle time
+        with open("/proc/stat", encoding="utf-8") as f:
+            v = [int(x) for x in f.readline().split()[1:9]]
+        return v[3] + v[4], sum(v)                  # idle + iowait
+    except (OSError, ValueError, IndexError, ImportError, AttributeError):
+        return None
+
+
+def offload_info(log_text):
+    """What llama-server reported about GPU use in its log."""
+    m = re.findall(r"offloaded (\d+)/(\d+) layers to GPU", log_text)
+    dev = re.findall(r"using device (\S+) \(([^)]*)\)", log_text)
+    parts = []
+    if m:
+        parts.append("offloaded %s/%s layers to GPU" % m[-1])
+    if dev:
+        parts.append("device: " + ", ".join("%s (%s)" % d for d in dev[:2]))
+    return " · ".join(parts)
+
+
+class HwMonitor:
+    """Samples CPU/GPU load while a request runs (system-wide, so it includes the server)."""
+
+    def __init__(self):
+        self.gpus = gpu_info()
+        self.ok = bool(self.gpus) or cpu_sample() is not None
+        self.stopper, self.thread = threading.Event(), None
+
+    def start(self):
+        self.cpu0, self.util, self.used, self.total = cpu_sample(), [], 0.0, 0.0
+        self.stopper.clear()
+        if self.gpus:
+            self.thread = threading.Thread(target=self.loop, daemon=True)
+            self.thread.start()
+
+    def loop(self):
+        while True:
+            g = gpu_info()
+            if g:
+                utils = [x["util"] for x in g if x["util"] is not None]
+                if utils:
+                    self.util.append(max(utils))
+                self.used, self.total = sum(x["used"] for x in g), sum(x["total"] for x in g)
+            if self.stopper.wait(1.0):
+                return
+
+    def stop(self):
+        """-> short text like 'CPU 63% · GPU 91% (peak), VRAM 5.2/12.0 GB' (empty if unknown)."""
+        if self.thread:
+            self.stopper.set()
+            self.thread.join(timeout=6)
+            self.thread = None
+        out = []
+        c1 = cpu_sample()
+        if self.cpu0 and c1 and c1[1] > self.cpu0[1]:
+            out.append("CPU %.0f%%" % (100.0 * (1 - (c1[0] - self.cpu0[0]) / (c1[1] - self.cpu0[1]))))
+        elif hasattr(os, "getloadavg"):
+            out.append("load %.1f/%d cores" % (os.getloadavg()[0], os.cpu_count() or 1))
+        if self.util:
+            out.append("GPU %.0f%% peak, VRAM %.1f/%.1f GB" %
+                       (max(self.util), self.used / 1024, self.total / 1024))
+        return " · ".join(out)
+
+    def describe(self):
+        lines = ["CPU: %s, %d threads" % (cpu_name() or "?", os.cpu_count() or 0)]
+        for g in gpu_info():
+            lines.append("GPU: %s, VRAM %.1f/%.1f GB used, %s%% load" %
+                         (g["name"], g["used"] / 1024, g["total"] / 1024,
+                          "%.0f" % g["util"] if g["util"] is not None else "?"))
+        if apple_silicon():
+            lines.append("GPU: Apple Silicon (Metal, shared memory)")
+        if len(lines) == 1:
+            lines.append("GPU: none detected (live numbers only for NVIDIA via nvidia-smi)")
+        return lines
+
+
 # --------------------------------------------------------------------- cli
 HELP = """\
 /ctx [n]    show / set context window (tokens)
 /compact    summarize the conversation to free context
 /clear      forget the conversation
 /auto       toggle auto-approve of file changes
+/hw         show CPU / GPU information and current load
 /help       this help
 /quit       exit  (Ctrl+C aborts a running reply)
 End a line with \\ for multi-line input."""
@@ -1119,8 +1294,15 @@ def run(args, client, root):
         say(paint("33", "warning: system prompt + tools use ~%d of %d tokens; "
                         "try --protocol text or a larger context" % (fixed, n_ctx)))
 
+    mon = HwMonitor()
+    hw = mon.describe()
+    say(dim("hardware: " + " | ".join(hw)))
     if args.prompt:
-        agent.run_turn(args.prompt)
+        mon.start()
+        try:
+            agent.run_turn(args.prompt)
+        finally:
+            say(dim("[%s]" % mon.stop()))
         return
     say(dim("/help for commands, Ctrl+D to quit"))
     while True:
@@ -1148,6 +1330,12 @@ def run(args, client, root):
             elif cmd == "/auto":
                 state["auto"] = not state["auto"]
                 say("auto-approve " + ("on" if state["auto"] else "off"))
+            elif cmd == "/hw":
+                for ln in mon.describe():
+                    say(ln)
+                share = client.ollama_gpu()
+                if share is not None:
+                    say("Ollama model in GPU memory: %.0f%%%s" % (share, "" if share >= 99 else " (rest runs on the CPU)"))
             elif cmd == "/ctx":
                 if arg.strip().isdigit():
                     agent.n_ctx = int(arg)
@@ -1156,8 +1344,13 @@ def run(args, client, root):
             else:
                 say("unknown command, see /help")
             continue
-        agent.run_turn(line)
-        say(dim("[context %d/%d · %d%%]" % (agent.used, agent.n_ctx, 100 * agent.used // max(1, agent.n_ctx))))
+        mon.start()
+        try:
+            agent.run_turn(line)
+        finally:
+            load = mon.stop()
+        say(dim("[context %d/%d · %d%%%s]" % (agent.used, agent.n_ctx, 100 * agent.used // max(1, agent.n_ctx),
+                                              " · " + load if load else "")))
 
 
 if __name__ == "__main__":

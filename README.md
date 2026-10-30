@@ -46,6 +46,9 @@ args = --n-gpu-layers 99
 - **llama.cpp:** gestartet wird `llama-server -m … -c <ctx> --host … --port … --jinja -np 1 <args>`
   (`--jinja` nur bei `protocol = native`; `-np 1`, damit das ganze Fenster dem Harness gehört).
   Liegt `llama-server` nicht im PATH, `command = /voller/pfad/llama-server` setzen.
+- **CPU / GPU (llama.cpp):** `gpu_layers` (leer = llama.cpp entscheidet, `all` = alles auf die GPU, `0` = nur CPU,
+  `N` = N Layer auf der GPU, der Rest läuft auf der CPU) und `threads` (CPU-Threads). Explizite `-ngl`/`-t` in `args`
+  haben Vorrang. Ein CUDA-/Vulkan-/Metal-Build von llama.cpp ist Voraussetzung, damit die GPU genutzt wird.
 - **Ollama:** `ollama serve` mit `OLLAMA_CONTEXT_LENGTH=<ctx>` und `OLLAMA_HOST`; `model` ist der Modellname
   (vorher `ollama pull`).
 - **custom:** beliebiger Befehl in `command`, `{host}`, `{port}`, `{ctx}` werden ersetzt.
@@ -55,6 +58,23 @@ args = --n-gpu-layers 99
   lassen will, startet ihn einfach selbst.
 - Serverausgabe steht in `miniharness-server.log`; startet der Server nicht, werden die letzten Zeilen gezeigt.
 - `--no-server` ignoriert den `[server]`-Abschnitt. Für Zugriff aus dem Netz `host = 0.0.0.0` setzen.
+
+## CPU- und GPU-Anzeige
+
+Beim Start zeigt das Harness die erkannte Hardware (CPU-Modell/Threads, GPU). Nach jeder Antwort steht in der
+Statuszeile die Auslastung *während* der Antwort, soweit das System sie liefert:
+
+```
+[context 1834/8192 · 22% · CPU 41% · GPU 93% peak, VRAM 6.1/12.0 GB]
+```
+
+- **CPU:** systemweit unter Linux (`/proc/stat`) und Windows; auf macOS die Load-Average.
+- **GPU:** live nur für NVIDIA (über `nvidia-smi`). Bei Apple Silicon wird „Metal“ angezeigt, bei AMD/Intel gibt es keine Livewerte.
+- **Server-Log:** startet miniharness llama.cpp selbst, wird aus dem Log gezeigt, wie viele Layer auf der GPU liegen
+  („offloaded 29/29 layers to GPU“). Steht eine GPU bereit, das Modell läuft aber auf der CPU, erscheint eine Warnung
+  (meist ein CPU-only-Build).
+- `/hw` im Programm zeigt Hardware und aktuelle Last jederzeit; bei Ollama zusätzlich, welcher Anteil des
+  Modells im GPU-Speicher liegt.
 
 ## Server im lokalen Netzwerk
 

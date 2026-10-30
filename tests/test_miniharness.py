@@ -262,5 +262,47 @@ class ConfigTests(Base):
         self.assertFalse(srv.listening())
 
 
+class HardwareTests(Base):
+    def test_parsing(self):
+        g = mh.parse_nvidia("NVIDIA RTX 4070, 1024, 12282, 37\nbroken line\n")
+        self.assertEqual(g, [{"name": "NVIDIA RTX 4070", "used": 1024.0, "total": 12282.0, "util": 37.0}])
+        info = mh.offload_info("offloaded 0/33 layers to GPU\noffloaded 33/33 layers to GPU\n"
+                               "using device CUDA0 (NVIDIA RTX 4070) - 11000 MiB free")
+        self.assertIn("offloaded 33/33 layers to GPU", info)
+        self.assertIn("CUDA0", info)
+
+    def test_gpu_and_thread_flags(self):
+        def cmd(body, **kw):
+            conf = mh.Config(Path(self._ini(body)))
+            return mh.server_command(mh.server_settings(conf, "", 4096, "native"))[0]
+        a = cmd("[server]\nstart = true\nmodel = m.gguf\ngpu_layers = all\nthreads = 6\n")
+        self.assertEqual(a[a.index("-ngl") + 1], "999")
+        self.assertEqual(a[a.index("-t") + 1], "6")
+        self.assertEqual(cmd("[server]\nstart = true\nmodel = m.gguf\ngpu_layers = 0\n")[-2:], ["-ngl", "0"])
+        a = cmd("[server]\nstart = true\nmodel = m.gguf\ngpu_layers = 5\nargs = -ngl 20\n")
+        self.assertEqual(a.count("-ngl"), 1)       # explicit args win
+        self.assertNotIn("-ngl", cmd("[server]\nstart = true\nmodel = m.gguf\n"))
+
+    def _ini(self, body):
+        path = self.root / "miniharness.ini"
+        path.write_text(body, encoding="utf-8")
+        return str(path)
+
+    @unittest.skipIf(os.name == "nt", "uses a shell script as fake nvidia-smi")
+    def test_monitor_with_fake_nvidia_smi(self):
+        exe = self.root / "nvidia-smi"
+        exe.write_text("#!/bin/sh\necho 'Fake GPU, 2048, 8192, 66'\n")
+        exe.chmod(0o755)
+        old = os.environ["PATH"]
+        os.environ["PATH"] = str(self.root) + os.pathsep + old
+        self.addCleanup(os.environ.__setitem__, "PATH", old)
+        mon = mh.HwMonitor()
+        self.assertEqual(len(mon.gpus), 1)
+        mon.start()
+        out = mon.stop()
+        self.assertIn("GPU 66% peak, VRAM 2.0/8.0 GB", out)
+        self.assertTrue(any("Fake GPU" in ln for ln in mon.describe()))
+
+
 if __name__ == "__main__":
     unittest.main()
