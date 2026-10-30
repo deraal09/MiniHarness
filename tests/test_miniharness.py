@@ -304,5 +304,58 @@ class HardwareTests(Base):
         self.assertTrue(any("Fake GPU" in ln for ln in mon.describe()))
 
 
+class MentionTests(Base):
+    def setUp(self):
+        super().setUp()
+        (self.root / "src").mkdir()
+        (self.root / "src" / "main.py").write_text("print('hi')\n")
+        (self.root / "notes.txt").write_text("\n".join("n%d" % i for i in range(300)))
+        (self.root / "my file.md").write_text("spaced\n")
+        (self.root / "logo.png").write_bytes(b"\x89PNG")
+        (self.root / ".git").mkdir()
+        (self.root / ".git" / "config").write_text("x")
+        self.files = mh.project_files(self.tools)
+
+    def answers(self, *a):
+        it = iter(a)
+        self.asked_prompts = []
+        return lambda prompt: self.asked_prompts.append(prompt) or next(it)
+
+    def test_listing_and_ranking(self):
+        self.assertEqual(sorted(self.files), ["my file.md", "notes.txt", "src/main.py"])
+        self.assertEqual(mh.find_files(self.files, "main")[0], "src/main.py")
+        self.assertEqual(mh.find_files(self.files, "NOTES.TXT"), ["notes.txt"])
+        self.assertEqual(mh.find_files(self.files, "zzz"), [])
+
+    def test_exact_mention_and_dir_and_spaces(self):
+        text, rels = mh.expand_mentions('explain @src/main.py and @"my file.md" and @src',
+                                        self.tools, self.files, None)
+        self.assertEqual(text, 'explain src/main.py and "my file.md" and src')
+        self.assertEqual(rels, ["src/main.py", "my file.md", "src"])
+
+    def test_picker_by_number_and_filter(self):
+        text, rels = mh.expand_mentions("look at @", self.tools, self.files, self.answers("main", "1"))
+        self.assertEqual((text, rels), ("look at src/main.py", ["src/main.py"]))   # "main" filtered to 1 hit
+        text, rels = mh.expand_mentions("see @", self.tools, self.files, self.answers("1 3"))
+        self.assertEqual(len(rels), 2)
+        text, rels = mh.expand_mentions("hi @", self.tools, self.files, self.answers(""))
+        self.assertEqual((text, rels), ("hi @", []))                               # cancelled: unchanged
+
+    def test_unknown_mention_stays_text(self):
+        for ask in (None, self.answers()):
+            text, rels = mh.expand_mentions("ping @someone and mail a@b.de", self.tools, self.files, ask)
+            self.assertEqual((text, rels), ("ping @someone and mail a@b.de", []))
+
+    def test_sandbox_and_attach_limits(self):
+        text, rels = mh.expand_mentions("@../secret", self.tools, self.files, None)
+        self.assertEqual(rels, [])
+        out = mh.attach_text(self.tools, ["notes.txt", "src", "missing.txt"], 900)
+        self.assertIn("### notes.txt", out)
+        self.assertIn("start_line=", out)                  # big file is cut with a continue hint
+        self.assertIn("main.py", out)                      # folder -> listing
+        self.assertIn("ERROR: no such file", out)
+        self.assertLess(len(out), 1800)
+
+
 if __name__ == "__main__":
     unittest.main()

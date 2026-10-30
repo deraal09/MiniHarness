@@ -28,13 +28,15 @@ import urllib.request
 from pathlib import Path
 
 try:  # line editing + history on Linux/macOS; harmless if missing (Windows)
-    import readline  # noqa: F401
+    import readline
 except ImportError:
-    pass
+    readline = None
 
 DEFAULT_URL = "http://127.0.0.1:8080/v1"
 DEFAULT_CTX = 4096
 MAX_FILE_BYTES = 4_000_000
+BINARY_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".gz", ".tar", ".7z",
+              ".exe", ".dll", ".so", ".bin", ".gguf", ".pyc", ".mp3", ".mp4", ".wav", ".sqlite", ".db"}
 SKIP_DIRS = {".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv"}
 
 
@@ -188,6 +190,9 @@ class Tools:
         return "\n".join(out) or "[empty folder]"
 
     def read_file(self, path, start_line=1, max_lines=None):
+        return self.read_text(path, start_line, max_lines, self.cap())
+
+    def read_text(self, path, start_line, max_lines, cap):
         full = self.resolve(path)
         if not full.is_file():
             raise ToolError("no such file: " + str(path))
@@ -202,7 +207,7 @@ class Tools:
         limit = _int(max_lines, 0) or None
         if start > total:
             raise ToolError("start_line %d is beyond end of file (%d lines)" % (start, total))
-        cap, used, out, i = self.cap(), 0, [], start - 1
+        used, out, i = 0, [], start - 1
         while i < total and (limit is None or len(out) < limit):
             ln = lines[i]
             if len(ln) > cap:
@@ -1145,6 +1150,121 @@ class HwMonitor:
         return lines
 
 
+# ------------------------------------------------------- file mentions (@)
+MENTION = re.compile(r'(?<!\S)@(?:"([^"]*)"|(\S*))')
+
+
+def project_files(tools, limit=2000):
+    """Relative paths of the (non-binary) files in the project folder."""
+    out = []
+    for f in tools.walk(tools.root):
+        if f.suffix.lower() not in BINARY_EXT:
+            out.append(tools.rel(f))
+            if len(out) >= limit:
+                break
+    return out
+
+
+def find_files(files, query):
+    q = query.lower().replace("\\", "/")
+
+    def rank(f):
+        fl = f.lower()
+        base = fl.rsplit("/", 1)[-1]
+        for r, hit in enumerate((fl == q, base.startswith(q), fl.startswith(q), q in base, q in fl)):
+            if hit:
+                return r
+        return None
+    ranked = sorted((r, len(f), f) for f in files for r in [rank(f)] if r is not None)
+    return [f for _, _, f in ranked]
+
+
+def pick_files(tools, files, query, ask, limit=20):
+    """Let the user choose files by number; typing text narrows the list. [] = cancelled."""
+    while True:
+        hits = find_files(files, query)
+        if not hits:
+            say(dim("no file matches '%s'" % query))
+            return []
+        if len(hits) == 1 and query:
+            say(dim("@%s -> %s" % (query, hits[0])))
+            return hits
+        say(paint("36", "files%s:" % (" matching '%s'" % query if query else "")))
+        for i, f in enumerate(hits[:limit], 1):
+            say("  %2d) %s %s" % (i, f, dim("(%s)" % _size(tools.root / f))))
+        if len(hits) > limit:
+            say(dim("  ... %d more - type text to narrow down" % (len(hits) - limit)))
+        try:
+            ans = ask("number(s) to attach, text to filter, Enter = cancel: ").strip()
+        except EOFError:
+            return []
+        if not ans:
+            return []
+        if re.fullmatch(r"[\d\s,]+", ans):
+            nums = [int(n) for n in re.findall(r"\d+", ans)]
+            return list(dict.fromkeys(hits[n - 1] for n in nums if 1 <= n <= min(limit, len(hits))))
+        query = ans
+
+
+def expand_mentions(text, tools, files, ask):
+    """Replace @tokens by file paths; -> (new text, [relative paths to attach]).
+    ask=None: only exact paths are resolved (no questions)."""
+    rels = []
+
+    def quote(p):
+        return '"%s"' % p if " " in p else p
+
+    def repl(m):
+        tok = (m.group(1) if m.group(1) is not None else m.group(2)).replace("\\", "/")
+        if tok:
+            try:
+                full = tools.resolve(tok)
+            except ToolError:
+                return m.group(0)
+            if full.exists():
+                r = tools.rel(full)
+                rels.append(r)
+                return quote(r)
+        if ask is None:
+            return m.group(0)
+        picked = pick_files(tools, files, tok, ask)
+        rels.extend(picked)
+        return " ".join(quote(p) for p in picked) or m.group(0)
+    return MENTION.sub(repl, text), list(dict.fromkeys(rels))
+
+
+def attach_text(tools, rels, total_chars):
+    """Contents of the chosen files/folders for the message, size-limited for the context window."""
+    per = max(300, total_chars // max(1, len(rels)))
+    parts = ["\n\n[Files attached by the user]"]
+    for r in rels:
+        try:
+            body = tools.list_files(r) if tools.resolve(r).is_dir() else tools.read_text(r, 1, None, per)
+        except (ToolError, OSError) as e:
+            body = "ERROR: %s" % (getattr(e, "strerror", None) or e)
+        parts.append("### %s\n%s" % (r, body))
+    return "\n".join(parts)
+
+
+def setup_completion(get_files):
+    """Tab completion for @paths where a readline module exists (Linux/macOS)."""
+    if readline is None:
+        return
+
+    def complete(text, state):
+        if not text.startswith("@"):
+            return None
+        opts = ["@" + f for f in find_files(get_files(), text[1:]) if " " not in f]
+        return opts[state] if state < len(opts) else None
+    try:
+        readline.set_completer_delims(" \t\n")
+        readline.set_completer(complete)
+        readline.parse_and_bind("bind ^I rl_complete" if "libedit" in (readline.__doc__ or "")
+                                else "tab: complete")
+    except (OSError, ValueError):
+        pass
+
+
 # --------------------------------------------------------------------- cli
 HELP = """\
 /ctx [n]    show / set context window (tokens)
@@ -1152,6 +1272,8 @@ HELP = """\
 /clear      forget the conversation
 /auto       toggle auto-approve of file changes
 /hw         show CPU / GPU information and current load
+/files [x]  list the files in the folder, pick some to attach to your next message
+@name       in a message: attach that file (@ alone or @part opens a picker, Tab completes)
 /help       this help
 /quit       exit  (Ctrl+C aborts a running reply)
 End a line with \\ for multi-line input."""
@@ -1297,13 +1419,36 @@ def run(args, client, root):
     mon = HwMonitor()
     hw = mon.describe()
     say(dim("hardware: " + " | ".join(hw)))
+
+    cache = {"t": 0.0, "files": []}
+    pending = []                                # files chosen with /files for the next message
+
+    def files():
+        if time.time() - cache["t"] > 5:
+            cache["files"], cache["t"] = project_files(agent.tools), time.time()
+        return cache["files"]
+
+    def compose(text, ask):
+        """@mentions + files queued by /files -> the message text sent to the model."""
+        text, rels = expand_mentions(text, agent.tools, files(), ask)
+        rels = list(dict.fromkeys(pending + rels))
+        del pending[:]
+        if rels:
+            say(dim("attached: " + ", ".join(rels)))
+            text += attach_text(agent.tools, rels, int(agent.n_ctx * agent.ratio * 0.35))
+        return text
+
     if args.prompt:
         mon.start()
         try:
-            agent.run_turn(args.prompt)
+            agent.run_turn(compose(args.prompt, None))
         finally:
             say(dim("[%s]" % mon.stop()))
         return
+    setup_completion(files)
+    names = files()
+    say(dim("%d files in folder%s - @ attaches a file, /files lists them" %
+            (len(names), ": " + ", ".join(names[:8]) + (", ..." if len(names) > 8 else "") if names else "")))
     say(dim("/help for commands, Ctrl+D to quit"))
     while True:
         try:
@@ -1330,6 +1475,16 @@ def run(args, client, root):
             elif cmd == "/auto":
                 state["auto"] = not state["auto"]
                 say("auto-approve " + ("on" if state["auto"] else "off"))
+            elif cmd == "/files":
+                cache["t"] = 0.0
+                try:
+                    chosen = pick_files(agent.tools, files(), arg.strip(), input, limit=100)
+                except KeyboardInterrupt:
+                    chosen = []
+                    say(dim("\n(cancelled)"))
+                pending.extend(chosen)
+                if chosen:
+                    say(dim("will be attached to your next message: " + ", ".join(pending)))
             elif cmd == "/hw":
                 for ln in mon.describe():
                     say(ln)
@@ -1343,6 +1498,11 @@ def run(args, client, root):
                     (agent.n_ctx, agent.used, 100 * agent.used // max(1, agent.n_ctx)))
             else:
                 say("unknown command, see /help")
+            continue
+        try:
+            line = compose(line, input)
+        except KeyboardInterrupt:
+            say(dim("\n(cancelled)"))
             continue
         mon.start()
         try:

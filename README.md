@@ -59,6 +59,23 @@ args = --n-gpu-layers 99
 - Serverausgabe steht in `miniharness-server.log`; startet der Server nicht, werden die letzten Zeilen gezeigt.
 - `--no-server` ignoriert den `[server]`-Abschnitt. Für Zugriff aus dem Netz `host = 0.0.0.0` setzen.
 
+## Dateien auflisten und per @ anhängen
+
+Beim Start zeigt das Programm, wie viele Dateien im Ordner liegen (Binärdateien wie Bilder, PDFs, `.gguf` und
+Ordner wie `.git`/`node_modules` werden ausgelassen).
+
+- **`/files`** listet die Dateien nummeriert auf (`/files text` filtert). Mit Zahl(en) (`1 3`) wählen Sie Dateien aus;
+  sie werden an Ihre **nächste** Nachricht angehängt. Statt einer Zahl können Sie Text eingeben, um die Liste einzugrenzen.
+- **`@` in einer Nachricht:**
+  - `erkläre @src/main.py` hängt die Datei an (exakter Pfad, Anführungszeichen bei Leerzeichen: `@"mein Text.md"`).
+  - `@` allein oder `@teil` öffnet die Auswahlliste; eine einzige Übereinstimmung wird direkt genommen,
+    Enter bricht ab (der Text bleibt unverändert). `@name` ohne passende Datei (z. B. `@kollege`) bleibt normaler Text.
+  - `@ordner` hängt dessen Dateiliste an.
+  - Unter Linux/macOS vervollständigt **Tab** `@pfade` direkt beim Tippen.
+- Der Dateiinhalt landet mit in der Nachricht, aber höchstens ~35 % des Kontextfensters (verteilt auf alle
+  angehängten Dateien). Ist eine Datei größer, steht am Ende `start_line=N` – das Modell liest dann gezielt weiter.
+- Im `-p`-Modus werden nur exakte Pfade aufgelöst (keine Rückfragen).
+
 ## CPU- und GPU-Anzeige
 
 Beim Start zeigt das Harness die erkannte Hardware (CPU-Modell/Threads, GPU). Nach jeder Antwort steht in der
