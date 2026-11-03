@@ -348,7 +348,8 @@ class Client:
         except urllib.error.HTTPError as e:
             raw = e.read().decode("utf-8", "replace")
             try:
-                err = json.loads(raw).get("error", raw)
+                body = json.loads(raw)
+                err = body.get("error") or body.get("message") or raw     # OpenAI/llama.cpp vs. vLLM shape
                 raw = err.get("message", raw) if isinstance(err, dict) else str(err)
             except (ValueError, AttributeError):
                 pass
@@ -380,7 +381,7 @@ class Client:
     def server_ctx(self):
         """(context tokens, source) the server really runs with, or (None, None).
 
-        llama.cpp: /props. Ollama: /api/ps (loaded model) or `num_ctx` of the model's
+        llama.cpp: /props. vLLM: max_model_len. Ollama: /api/ps (loaded model) or `num_ctx` of the model's
         parameters. The model's *trained* maximum is deliberately not used."""
         u = urllib.parse.urlparse(self.base)
         root = "%s://%s" % (u.scheme, u.netloc)
@@ -390,6 +391,11 @@ class Client:
                 return n, "llama.cpp /props"
         except (KeyError, TypeError, ValueError):
             pass
+        models = (self._json(self.base + "/models") or {}).get("data") or []
+        for m in models:                     # vLLM reports the real limit as max_model_len
+            if isinstance(m, dict) and m.get("max_model_len") and (not self.model or m.get("id") == self.model
+                                                                   or len(models) == 1):
+                return int(m["max_model_len"]), "vLLM /v1/models"
         name = self.model.split(":")[0]
         for m in (self._json(root + "/api/ps") or {}).get("models") or []:
             if str(m.get("name", "")).split(":")[0] == name and m.get("context_length"):
@@ -425,10 +431,11 @@ class Client:
                 usage = ev.get("usage") or usage
                 for ch in ev.get("choices") or []:
                     d = ch.get("delta") or {}
-                    if on_chunk and (d.get("content") or d.get("reasoning_content") or d.get("tool_calls")):
+                    think = d.get("reasoning_content") or d.get("reasoning")      # llama.cpp / vLLM
+                    if on_chunk and (d.get("content") or think or d.get("tool_calls")):
                         on_chunk()
-                    if d.get("reasoning_content") and on_think:
-                        on_think(d["reasoning_content"])
+                    if think and on_think:
+                        on_think(think)
                     if d.get("content"):
                         content.append(d["content"])
                         if on_text:
@@ -455,14 +462,67 @@ def fmt_secs(t):
     return "%.1fs" % t if t < 60 else "%dm %02ds" % (t // 60, t % 60)
 
 
-class Ticker:
-    """Times a turn (user waiting time excluded) and shows a live line while nothing else is
-    on screen, i.e. while the model works its way through the prompt or builds a tool call."""
+def _w(text):
+    sys.stdout.write(text)
+    sys.stdout.flush()
 
-    def __init__(self, live=None):
-        self.live = sys.stdout.isatty() if live is None else live
+
+class Footer:
+    """Status bar pinned to the last terminal line (scroll region), updated live.
+    Only active on a real terminal; everything else keeps scrolling above it."""
+
+    def __init__(self):
+        self.on, self.rows, self.text_fn, self.lock = False, 0, lambda: "", threading.Lock()
+
+    def enable(self, text_fn):
+        if self.on or not (sys.stdout.isatty() and sys.stdin.isatty()) or os.environ.get("TERM") == "dumb":
+            return False
+        rows = shutil.get_terminal_size()[1]
+        if rows < 8:
+            return False
+        if os.name == "nt":
+            os.system("")                   # enable VT sequences in the Windows console
+        self.text_fn, self.rows, self.on = text_fn, rows, True
+        # make room for one line, then keep scrolling above it: save cursor, set region, restore
+        _w("\n\033[1A\0337\033[1;%dr\0338" % (rows - 1))
+        atexit.register(self.disable)
+        self.draw()
+        return True
+
+    def draw(self):
+        if not self.on:
+            return
+        with self.lock:
+            cols, rows = shutil.get_terminal_size()
+            pre = ""
+            if rows != self.rows:           # terminal was resized
+                pre, self.rows = "\0337\033[1;%dr\0338" % (rows - 1), rows
+            try:
+                text = self.text_fn() or ""
+            except Exception:               # a status bar must never take the program down
+                text = ""
+            _w(pre + "\0337\033[%d;1H\033[2K\033[7m%s\033[0m\0338" % (rows, text[:cols - 1].ljust(cols - 1)))
+
+    def disable(self):
+        if self.on:
+            self.on = False
+            _w("\0337\033[r\033[%d;1H\033[2K\0338" % self.rows)
+
+
+FOOTER = Footer()
+INLINE_LABELS = ("waiting for model", "summarizing old messages")
+
+
+class Ticker:
+    """Times a turn (user waiting time excluded) and shows it live: in the pinned footer if there
+    is one, otherwise as a line that appears while nothing else is on screen."""
+
+    def __init__(self, live=None, footer=None):
+        self.footer = footer
+        self.live = (sys.stdout.isatty() if live is None else live) and footer is None
         self.lock = threading.Lock()
         self.label, self.t0, self.paused_s, self.pause_at = "", None, 0.0, None
+        self.chunks, self.first_chunk = 0, None
         self.shown, self.stopper, self.thread = False, threading.Event(), None
 
     def elapsed(self):
@@ -471,20 +531,38 @@ class Ticker:
         now = self.pause_at or time.time()
         return now - self.t0 - self.paused_s
 
+    def call_started(self):
+        self.chunks, self.first_chunk = 0, None
+
+    def chunk(self):
+        """One streamed piece from the model (about one token)."""
+        if self.first_chunk is None:
+            self.first_chunk = time.time()
+            if self.footer:
+                self.label = "generating"
+        self.chunks += 1
+
+    def rate(self):
+        if self.first_chunk and self.chunks > 3 and time.time() - self.first_chunk > 0.5:
+            return self.chunks / (time.time() - self.first_chunk)
+        return 0.0
+
     def start(self):
         self.t0, self.paused_s, self.pause_at, self.label = time.time(), 0.0, None, ""
         self.stopper.clear()
-        if self.live:
+        if self.live or self.footer:
             self.thread = threading.Thread(target=self.loop, daemon=True)
             self.thread.start()
 
     def loop(self):
-        while not self.stopper.wait(0.2):
+        while not self.stopper.wait(0.25):
             with self.lock:
                 self.draw()
 
     def draw(self):
-        if self.live and self.label and self.pause_at is None:
+        if self.footer:
+            self.footer.draw()
+        elif self.live and self.label in INLINE_LABELS and self.pause_at is None:
             sys.stdout.write("\r" + dim("· %s  %s" % (fmt_secs(self.elapsed()), self.label)) + "\033[K")
             sys.stdout.flush()
             self.shown = True
@@ -496,22 +574,24 @@ class Ticker:
             self.shown = False
 
     def phase(self, label):
-        """Set what we are waiting for; '' = something else owns the screen (hides the line)."""
+        """What we are doing now. Without a footer the live line only shows while we merely wait."""
         if self.t0 is None:
             return
         with self.lock:
             self.label = label
-            if label:
+            if self.footer or label in INLINE_LABELS:
                 self.draw()
             else:
                 self.erase()
 
     def pause(self):
-        """Stop counting and drawing while the user is asked something."""
+        """Stop counting while the user is asked something."""
         if self.t0 is not None and self.pause_at is None:
             with self.lock:
                 self.erase()
                 self.pause_at = time.time()
+                if self.footer:
+                    self.footer.draw()
 
     def resume(self):
         if self.t0 is not None and self.pause_at is not None:
@@ -738,18 +818,20 @@ class Agent:
             sent = self.chars(self.msgs)
             started = [False]
             t = {"start": time.time(), "first": None}
+            self.ticker.call_started()
 
             def on_chunk():
                 if t["first"] is None:
                     t["first"] = time.time()
+                self.ticker.chunk()
 
             def on_text(piece):
-                self.ticker.phase("")
+                self.ticker.phase("generating")
                 started[0] = True
                 say(piece, end="")
 
             def on_think(piece):
-                self.ticker.phase("")
+                self.ticker.phase("generating")
                 say(dim(piece), end="")
 
             try:
@@ -757,7 +839,9 @@ class Agent:
                                        self.a.temperature, on_text, on_think, on_chunk)
             except LLMError as e:
                 if e.is_context and attempt < 2:
-                    self.n_ctx = int(self.n_ctx * 0.75)
+                    limit = re.search(r"maximum context length is (\d+)", str(e))     # vLLM names the limit
+                    self.n_ctx = int(limit.group(1)) if limit and int(limit.group(1)) < self.n_ctx \
+                        else int(self.n_ctx * 0.75)
                     say(dim("[server rejected the size, assuming context %d]" % self.n_ctx))
                     continue
                 raise
@@ -843,8 +927,10 @@ class Agent:
                 self.msgs.append({"role": "assistant", "content": "(interrupted)"})
         except (LLMError, ContextError) as e:
             say(paint("31", "error: %s" % e))
-            if "tool" in str(e).lower() and "support" in str(e).lower():
-                say(paint("33", "this model has no tool support; try --protocol text"))
+            low = str(e).lower()
+            if "tool" in low and ("support" in low or "tool-choice" in low or "tool-call-parser" in low):
+                say(paint("33", "the server can't do tool calls (vLLM: --enable-auto-tool-choice "
+                                "--tool-call-parser ...); fix that or use --protocol text"))
             if self.msgs and self.msgs[-1]["role"] == "user" and not self.msgs[-1].get("_cont"):
                 self.msgs.pop()  # let the user retry without a dangling message
 
@@ -877,9 +963,9 @@ def _fmt_call(c):
 # ------------------------------------------------- config file + server
 CONFIG_NAME = "miniharness.ini"
 HARNESS_KEYS = {"dir", "url", "model", "api_key", "ctx", "max_tokens", "protocol",
-                "temperature", "max_steps", "summarize", "auto_approve"}
+                "temperature", "max_steps", "summarize", "auto_approve", "footer"}
 SERVER_KEYS = {"start", "type", "command", "model", "hf_repo", "host", "port", "args",
-               "timeout", "log", "gpu_layers", "threads"}
+               "timeout", "log", "gpu_layers", "threads", "tool_parser"}
 
 TEMPLATE = """\
 # miniharness configuration. Lines starting with # or ; are comments
@@ -906,16 +992,19 @@ max_steps = 20
 summarize = true
 # Apply file changes without asking.
 auto_approve = false
+# Status bar on the last terminal line with live time, speed, context and CPU/GPU load.
+footer = true
 
 [server]
 # true: miniharness starts the server if nothing listens on host:port and stops it on exit.
 start = true
-# llama.cpp | ollama | custom
+# llama.cpp | ollama | vllm | custom
 type = llama.cpp
 # Executable (empty = llama-server / ollama from PATH). For "custom" the full command line;
 # {host}, {port} and {ctx} are replaced.
 command =
 # llama.cpp: path to the .gguf file ... or a Hugging Face repo (downloaded on first start).
+# vllm: Hugging Face model id or local folder, e.g. Qwen/Qwen2.5-7B-Instruct. ollama: model name.
 model = /path/to/model.gguf
 hf_repo =
 host = 127.0.0.1
@@ -926,7 +1015,10 @@ gpu_layers =
 threads =
 # Extra arguments, e.g. --flash-attn on
 args =
-# Seconds to wait until the server answers (loading big models takes a while).
+# vllm only: --tool-call-parser for native tool calls (hermes = Qwen2.5/3 and Hermes; llama3_json,
+# mistral, ... see the vLLM docs). Ignored with protocol = text.
+tool_parser = hermes
+# Seconds to wait until the server answers (loading big models takes a while; vllm default 600).
 timeout = 180
 log = miniharness-server.log
 """
@@ -1003,18 +1095,26 @@ def server_settings(conf, url, ctx, protocol):
     except ValueError:
         sys.exit("[server] start must be true or false")
     kind = s.get("type", "llama.cpp").lower().replace("llamacpp", "llama.cpp")
-    if kind not in ("llama.cpp", "ollama", "custom"):
-        sys.exit("[server] type must be llama.cpp, ollama or custom")
+    if kind not in ("llama.cpp", "ollama", "vllm", "custom"):
+        sys.exit("[server] type must be llama.cpp, ollama, vllm or custom")
     u = urllib.parse.urlparse(url) if url else None
-    port = _int(s.get("port"), 0) or (u and u.port) or (11434 if kind == "ollama" else 8080)
+    port = _int(s.get("port"), 0) or (u and u.port) or {"ollama": 11434, "vllm": 8000}.get(kind, 8080)
     host = s.get("host", "127.0.0.1")
     return {"type": kind, "command": s.get("command", ""), "model": s.get("model", ""),
             "hf_repo": s.get("hf_repo", ""), "host": host, "port": port,
             "connect_host": "127.0.0.1" if host in ("0.0.0.0", "::", "") else host,
             "gpu_layers": s.get("gpu_layers", "").lower(), "threads": s.get("threads", ""),
-            "args": split_cmd(s.get("args", "")), "timeout": _int(s.get("timeout"), 180),
+            "args": split_cmd(s.get("args", "")), "tool_parser": s.get("tool_parser", "hermes"),
+            "timeout": _int(s.get("timeout"), 600 if kind == "vllm" else 180),
             "log": s.get("log") or str(conf.base / "miniharness-server.log"),
             "ctx": ctx, "protocol": protocol}
+
+
+def exe_argv(command, default):
+    """`command` is a program path (may contain spaces) or a command line like 'wsl vllm'."""
+    if not command:
+        return [default]
+    return [command] if Path(command).is_file() else split_cmd(command)
 
 
 def server_command(c):
@@ -1022,7 +1122,17 @@ def server_command(c):
     kind, extra = c["type"], c["args"]
     if kind == "ollama":
         env = {"OLLAMA_HOST": "%s:%d" % (c["host"], c["port"]), "OLLAMA_CONTEXT_LENGTH": str(c["ctx"])}
-        return [c["command"] or "ollama", "serve"] + extra, env
+        return exe_argv(c["command"], "ollama") + ["serve"] + extra, env
+    if kind == "vllm":
+        if not c["model"]:
+            sys.exit("[server] set model (Hugging Face id or folder) for vllm")
+        argv = exe_argv(c["command"], "vllm") + ["serve", c["model"], "--host", c["host"],
+                                                  "--port", str(c["port"]), "--max-model-len", str(c["ctx"])]
+        if c["protocol"] == "native" and "--enable-auto-tool-choice" not in extra:
+            argv += ["--enable-auto-tool-choice"]
+            if "--tool-call-parser" not in extra:
+                argv += ["--tool-call-parser", c["tool_parser"]]
+        return argv + extra, {}
     if kind == "custom":
         if not c["command"]:
             sys.exit("[server] type = custom needs command")
@@ -1030,7 +1140,7 @@ def server_command(c):
         for k in ("host", "port", "ctx"):
             cmd = cmd.replace("{%s}" % k, str(c[k]))
         return split_cmd(cmd) + extra, {}
-    argv = [c["command"] or "llama-server"]
+    argv = exe_argv(c["command"], "llama-server")
     if c["hf_repo"]:
         argv += ["-hf", c["hf_repo"]]
     elif c["model"]:
@@ -1220,8 +1330,25 @@ class HwMonitor:
         self.gpus = gpu_info()
         self.ok = bool(self.gpus) or cpu_sample() is not None
         self.stopper, self.thread = threading.Event(), None
+        self.running, self.lc, self.lt, self.lcpu = False, None, 0.0, None
+
+    def live(self):
+        """Current load for the status bar (CPU refreshed about once a second)."""
+        if not self.running:
+            return ""
+        now = time.time()
+        if now - self.lt >= 1.0:
+            c = cpu_sample()
+            if self.lc and c and c[1] > self.lc[1]:
+                self.lcpu = 100.0 * (1 - (c[0] - self.lc[0]) / (c[1] - self.lc[1]))
+            self.lc, self.lt = c, now
+        out = ["CPU %.0f%%" % self.lcpu] if self.lcpu is not None else []
+        if self.util:
+            out.append("GPU %.0f%% VRAM %.1f/%.1fG" % (self.util[-1], self.used / 1024, self.total / 1024))
+        return " ".join(out)
 
     def start(self):
+        self.running, self.lc, self.lt, self.lcpu = True, cpu_sample(), time.time(), None
         self.cpu0, self.util, self.used, self.total = cpu_sample(), [], 0.0, 0.0
         self.stopper.clear()
         if self.gpus:
@@ -1241,6 +1368,7 @@ class HwMonitor:
 
     def stop(self):
         """-> short text like 'CPU 63% · GPU 91% (peak), VRAM 5.2/12.0 GB' (empty if unknown)."""
+        self.running = False
         if self.thread:
             self.stopper.set()
             self.thread.join(timeout=6)
@@ -1390,7 +1518,7 @@ HELP = """\
 /compact    summarize the conversation to free context
 /clear      forget the conversation
 /auto       toggle auto-approve of file changes
-/hw         show CPU / GPU information and current load
+/hw         show CPU / GPU information and current load  (live values are in the status bar)
 /files [x]  list the files in the folder, pick some to attach to your next message
 @name       in a message: attach that file (@ alone or @part opens a picker, Tab completes)
 /help       this help
@@ -1450,6 +1578,8 @@ def parse_args(argv=None):
                     help="drop old messages without summarizing them")
     ap.add_argument("-y", "--yes", action="store_true", default=d(None, "auto_approve", False, _bool),
                     help="apply file changes without asking")
+    ap.add_argument("--no-footer", dest="footer", action="store_false", default=d(None, "footer", True, _bool),
+                    help="no pinned status bar (just a live line while waiting)")
     ap.add_argument("-p", "--prompt", help="run a single prompt and exit")
     args = ap.parse_args(argv)
     args.conf = conf
@@ -1497,6 +1627,13 @@ def main(argv=None):
 
 
 def run(args, client, root):
+    try:
+        _run(args, client, root)
+    finally:
+        FOOTER.disable()
+
+
+def _run(args, client, root):
 
     if not args.model:
         client.model = client.pick_model() or client.model
@@ -1576,6 +1713,22 @@ def run(args, client, root):
         perf = agent.perf_text()
         return " · ".join(x for x in (fmt_secs(secs) + (" (%s)" % perf if perf else ""), load) if x)
 
+    last = {"stats": ""}
+
+    def footer_text():
+        ctx = "ctx %d/%d (%d%%)" % (agent.used, agent.n_ctx, 100 * agent.used // max(1, agent.n_ctx))
+        if ticker.t0 is not None:
+            left = "%s  %s" % (fmt_secs(ticker.elapsed()),
+                               "waiting for you" if ticker.pause_at else ticker.label or "working")
+            if ticker.chunks:
+                left += "  ~%d tok" % ticker.chunks + ("  %.1f tok/s" % ticker.rate() if ticker.rate() else "")
+        else:
+            left = "ready" + ("  last: " + last["stats"] if last["stats"] else "")
+        return " " + " | ".join(x for x in (left, ctx, mon.live()) if x)
+
+    if args.footer and FOOTER.enable(footer_text):
+        ticker.footer, ticker.live = FOOTER, False
+
     if args.prompt:
         say(dim("[%s]" % timed_turn(compose(args.prompt, None))))
         return
@@ -1639,8 +1792,12 @@ def run(args, client, root):
             say(dim("\n(cancelled)"))
             continue
         stats = timed_turn(line)
-        say(dim("[context %d/%d · %d%% · %s]" % (agent.used, agent.n_ctx,
-                                                100 * agent.used // max(1, agent.n_ctx), stats)))
+        last["stats"] = stats
+        if FOOTER.on:
+            FOOTER.draw()
+        else:
+            say(dim("[context %d/%d · %d%% · %s]" % (agent.used, agent.n_ctx,
+                                                    100 * agent.used // max(1, agent.n_ctx), stats)))
 
 
 if __name__ == "__main__":

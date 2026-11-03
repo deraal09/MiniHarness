@@ -1,6 +1,6 @@
 # miniharness
 
-Schlanker Terminal-Harness für ein **lokales LLM** (llama.cpp, Ollama oder jede OpenAI-kompatible API).
+Schlanker Terminal-Harness für ein **lokales LLM** (llama.cpp, Ollama, vLLM oder jede OpenAI-kompatible API).
 Das Modell kann Textdateien in **einem** Ordner auflisten, lesen, durchsuchen und bearbeiten –
 ausgelegt auf **kleine Kontextfenster**. Eine Datei, nur Python-Standardbibliothek
 (Python ≥ 3.8), läuft unter Linux, macOS und Windows.
@@ -16,6 +16,26 @@ python miniharness.py --dir ./mein-ordner
 ```
 
 Windows: `py miniharness.py --dir C:\pfad\ordner` (Port, URL usw. wie unten).
+
+## vLLM
+
+[vLLM](https://docs.vllm.ai) bietet ebenfalls eine OpenAI-kompatible API (Standardport 8000):
+
+```bash
+vllm serve Qwen/Qwen2.5-7B-Instruct --max-model-len 8192 \
+     --enable-auto-tool-choice --tool-call-parser hermes
+python miniharness.py --url http://127.0.0.1:8000/v1
+```
+
+- Der Modellname wird vom Server übernommen (`/v1/models`), das **Kontextfenster** ebenfalls (`max_model_len`).
+- Für `protocol = native` braucht vLLM `--enable-auto-tool-choice --tool-call-parser <parser>` (`hermes` für
+  Qwen2.5/3 und Hermes, `llama3_json`, `mistral`, … je nach Modell). Ohne diese Optionen meldet vLLM einen Fehler;
+  dann entweder nachrüsten oder `--protocol text` nutzen.
+- Überschreitet eine Anfrage das Limit, liest das Harness die genannte Grenze aus der Fehlermeldung und versucht es erneut.
+- Automatisch starten: in der Config `type = vllm`, `model = Qwen/Qwen2.5-7B-Instruct`, optional `tool_parser = hermes`
+  und `args = --gpu-memory-utilization 0.85`. Das Harness ruft `vllm serve <model> --host … --port … --max-model-len <ctx>`
+  auf; der Start-Timeout beträgt hier 600 s, weil vLLM lange lädt. Unter Windows läuft vLLM nur über WSL/Docker, z. B.
+  `command = wsl vllm`.
 
 ## Config-Datei: Server automatisch starten
 
@@ -37,7 +57,7 @@ protocol = native
 
 [server]
 start = true
-type = llama.cpp      ; llama.cpp | ollama | custom
+type = llama.cpp      ; llama.cpp | ollama | vllm | custom
 model = C:\modelle\qwen.gguf     ; oder hf_repo = Org/Repo-GGUF
 port = 8080
 args = --n-gpu-layers 99
@@ -51,6 +71,7 @@ args = --n-gpu-layers 99
   haben Vorrang. Ein CUDA-/Vulkan-/Metal-Build von llama.cpp ist Voraussetzung, damit die GPU genutzt wird.
 - **Ollama:** `ollama serve` mit `OLLAMA_CONTEXT_LENGTH=<ctx>` und `OLLAMA_HOST`; `model` ist der Modellname
   (vorher `ollama pull`).
+- **vllm:** siehe Abschnitt „vLLM“ (`model`, `tool_parser`).
 - **custom:** beliebiger Befehl in `command`, `{host}`, `{port}`, `{ctx}` werden ersetzt.
 - Lauscht auf dem Port schon ein Server, wird dieser benutzt und nicht neu gestartet (dann gelten
   dessen Einstellungen). Der selbst gestartete Server wird beim Beenden wieder gestoppt
@@ -76,23 +97,24 @@ Ordner wie `.git`/`node_modules` werden ausgelassen).
   angehängten Dateien). Ist eine Datei größer, steht am Ende `start_line=N` – das Modell liest dann gezielt weiter.
 - Im `-p`-Modus werden nur exakte Pfade aufgelöst (keine Rückfragen).
 
-## Zeitanzeige
+## Statusleiste mit Live-Zeit
 
-Solange das Modell arbeitet, ohne dass schon Text erscheint (Prompt wird verarbeitet, ein langer Tool-Aufruf wird
-aufgebaut, alte Nachrichten werden zusammengefasst), läuft eine Live-Zeile mit der verstrichenen Zeit:
-
-```
-· 12.4s  waiting for model
-```
-
-Sobald die Antwort gestreamt wird, verschwindet die Zeile. Nach jeder Nachricht steht die Gesamtdauer in der Statuszeile:
+Auf einem echten Terminal bleibt die **letzte Zeile fest stehen** (der Text scrollt darüber) und zeigt live:
 
 ```
-[context 1834/8192 · 22% · 14.8s (prompt 9.6s, 18.2 tok/s) · CPU 41% · GPU 93% peak, VRAM 6.1/12.0 GB]
+ 12.4s  generating  ~187 tok  18.2 tok/s | ctx 1834/8192 (22%) | CPU 41% GPU 93% VRAM 6.1/12.0G
 ```
 
-`prompt` = Wartezeit bis zum ersten Token, `tok/s` = Erzeugungsgeschwindigkeit. Wartezeit auf Ihre Bestätigung von
-Dateiänderungen wird nicht mitgezählt. Ohne Terminal (Ausgabe in Datei/Pipe) gibt es keine Live-Zeile, nur die Statuszeile.
+- **Links:** verstrichene Zeit der laufenden Anfrage und was gerade passiert – `waiting for model` (Prompt wird
+  verarbeitet), `generating` (mit geschätzter Tokenzahl und Geschwindigkeit), `summarizing old messages`,
+  `waiting for you` (Bestätigung einer Dateiänderung; diese Zeit wird nicht mitgezählt).
+- **Mitte:** Kontextbelegung der letzten Anfrage. **Rechts:** aktuelle CPU-/GPU-Last (GPU nur NVIDIA).
+- Im Leerlauf steht dort `ready  last: 14.8s (prompt 9.6s, 18.2 tok/s)`.
+- Abschalten mit `--no-footer` oder `footer = false` in der Config. Dann gibt es nur eine Live-Zeile, solange noch
+  kein Text erscheint, und nach jeder Nachricht eine Statuszeile `[context … · 14.8s (prompt 9.6s, 18.2 tok/s) · …]`.
+- Ohne Terminal (Pipe, Datei, `TERM=dumb`) und bei weniger als 8 Zeilen Höhe wird keine Leiste gezeichnet.
+  Beim Beenden (auch bei Strg+C oder Absturz) wird sie wieder entfernt; sollte das Terminal einmal durcheinander
+  sein, hilft `reset`.
 
 ## CPU- und GPU-Anzeige
 
@@ -152,7 +174,7 @@ python miniharness.py --url http://127.0.0.1:11434/v1 -m qwen2.5-coder:7b --ctx 
 Reihenfolge, in der die Größe bestimmt wird:
 
 1. `--ctx N` bzw. Umgebungsvariable `MINIHARNESS_CTX`
-2. automatisch vom Server (llama.cpp `/props`, Ollama `/api/ps` bzw. `num_ctx`)
+2. automatisch vom Server (llama.cpp `/props`, vLLM `max_model_len`, Ollama `/api/ps` bzw. `num_ctx`)
 3. Fallback 4096 (mit Hinweis)
 
 Zur Laufzeit mit `/ctx 8192` änderbar. Das Harness hält jede Anfrage unter

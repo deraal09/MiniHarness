@@ -20,6 +20,8 @@ class FakeLLM(BaseHTTPRequestHandler):
     n_ctx = 2048
     delay = 0.0      # seconds before the first token
     ollama = False   # behave like Ollama: no /props, /api/ps + /v1/models, tool calls without index
+    vllm = False     # behave like vLLM: /v1/models carries max_model_len
+    fail_ctx = False # answer the next chat request with vLLM's "maximum context length" error
 
     def log_message(self, *a):
         pass
@@ -30,6 +32,10 @@ class FakeLLM(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(obj).encode())
 
     def do_GET(self):
+        if self.vllm:
+            if self.path == "/v1/models":
+                return self.reply_json({"data": [{"id": "Qwen/Qwen2.5-7B", "max_model_len": 5000}]})
+            return self.reply_json({"detail": "Not Found"}, 404)
         if not self.ollama:
             return self.reply_json({"default_generation_settings": {"n_ctx": self.n_ctx}})
         if self.path == "/api/ps":
@@ -43,6 +49,11 @@ class FakeLLM(BaseHTTPRequestHandler):
         if self.path == "/api/show":
             return self.reply_json({"parameters": "num_ctx                        6144"})
         FakeLLM.requests.append(req)
+        if FakeLLM.fail_ctx:
+            FakeLLM.fail_ctx = False
+            return self.reply_json({"object": "error", "code": 400, "type": "BadRequestError", "message":
+                                    "This model's maximum context length is 3000 tokens. However, you "
+                                    "requested 9000 tokens in the messages."}, 400)
         step = FakeLLM.script.pop(0) if FakeLLM.script else {"content": "ok"}
         delta = {"content": step["content"]} if "content" in step else {"tool_calls": [{
             **({} if self.ollama else {"index": 0}), "id": "c1", "function": {
@@ -167,6 +178,20 @@ class EndToEnd(Base):
     def test_server_ctx(self):
         self.assertEqual(mh.Client(self.url).server_ctx(), (2048, "llama.cpp /props"))
 
+    def test_vllm(self):
+        FakeLLM.vllm = True
+        self.addCleanup(setattr, FakeLLM, "vllm", False)
+        c = mh.Client(self.url)
+        self.assertEqual(c.pick_model(), "Qwen/Qwen2.5-7B")
+        self.assertEqual(c.server_ctx(), (5000, "vLLM /v1/models"))
+        # vLLM's error names the real limit; the agent adopts it and retries
+        FakeLLM.fail_ctx = True
+        FakeLLM.script = [{"content": "ok"}]
+        a = mh.Agent(mh.parse_args(["--dir", str(self.root)]), c, self.tools, 8000)
+        a.run_turn("hi")
+        self.assertEqual(a.n_ctx, 3000)
+        self.assertEqual(a.msgs[-1]["content"], "ok")
+
     def test_ollama(self):
         FakeLLM.ollama = True
         self.addCleanup(setattr, FakeLLM, "ollama", False)
@@ -248,6 +273,21 @@ class ConfigTests(Base):
         self.assertEqual(argv, ["srv", "--p", "8080", "-c", "4096"])
         self.assertIsNone(mh.server_settings(mh.Config(Path(self.write_ini("[server]\nstart = false\n"))),
                                              "", 1, "native"))
+
+    def test_vllm_command(self):
+        def cmd(body, proto="native"):
+            conf = mh.Config(Path(self.write_ini(body)))
+            return mh.server_command(mh.server_settings(conf, "", 8192, proto))[0]
+        a = cmd("[server]\nstart = true\ntype = vllm\nmodel = Qwen/Qwen2.5-7B-Instruct\n"
+                "args = --gpu-memory-utilization 0.85\n")
+        self.assertEqual(a, ["vllm", "serve", "Qwen/Qwen2.5-7B-Instruct", "--host", "127.0.0.1", "--port", "8000",
+                             "--max-model-len", "8192", "--enable-auto-tool-choice", "--tool-call-parser",
+                             "hermes", "--gpu-memory-utilization", "0.85"])
+        a = cmd("[server]\nstart = true\ntype = vllm\nmodel = m\ncommand = wsl vllm\n", proto="text")
+        self.assertEqual(a[:3], ["wsl", "vllm", "serve"])
+        self.assertNotIn("--enable-auto-tool-choice", a)
+        a = cmd("[server]\nstart = true\ntype = vllm\nmodel = m\ntool_parser = llama3_json\n")
+        self.assertEqual(a[a.index("--tool-call-parser") + 1], "llama3_json")
 
     def test_start_and_stop_server(self):
         import socket
@@ -402,6 +442,37 @@ class TimerTests(Base):
     def test_fmt_and_perf(self):
         self.assertEqual(mh.fmt_secs(3.14), "3.1s")
         self.assertEqual(mh.fmt_secs(125), "2m 05s")
+
+
+class FooterTests(unittest.TestCase):
+    def test_footer_draws_on_last_line_and_cleans_up(self):
+        from unittest import mock
+        buf = io.StringIO()
+        f = mh.Footer()
+        f.on, f.rows, f.text_fn = True, 24, lambda: " 1.0s  generating"
+        with contextlib.redirect_stdout(buf), mock.patch("shutil.get_terminal_size", return_value=(80, 24)):
+            f.draw()
+            first = buf.getvalue()
+            f.disable()
+        self.assertIn("\0337\033[24;1H", first)            # save cursor, jump to the last row
+        self.assertIn("1.0s  generating", first)
+        self.assertTrue(first.endswith("\0338"))            # cursor restored
+        self.assertIn("\033[r", buf.getvalue()[len(first):])  # scroll region reset on exit
+        self.assertFalse(f.on)
+
+    def test_footer_disabled_without_tty(self):
+        self.assertFalse(mh.Footer().enable(lambda: ""))
+
+    def test_ticker_footer_label_follows_stream(self):
+        f = mh.Footer()
+        tk = mh.Ticker(footer=f)
+        tk.start()
+        tk.phase("waiting for model")
+        for _ in range(5):
+            tk.chunk()
+        self.assertEqual(tk.label, "generating")
+        self.assertEqual(tk.chunks, 5)
+        tk.stop()
 
 
 if __name__ == "__main__":
