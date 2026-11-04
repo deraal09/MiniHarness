@@ -7,6 +7,10 @@ ausgelegt auf **kleine Kontextfenster**. Eine Datei, nur Python-Standardbiblioth
 
 ## Start
 
+Beim Start wird das Terminal geleert (der Scrollback bleibt erhalten) und das ASCII-Logo „MiniHarness – for local LLM“
+angezeigt; danach folgen Config, Server, Kontext- und Hardware-Infos. Ohne Terminal (Pipe, `-p`) gibt es kein Logo.
+Abschalten mit `--no-banner` oder `banner = false` in der Config.
+
 ```bash
 # 1. Server starten (llama.cpp). --jinja wird für native Tool-Calls benötigt.
 llama-server -m modell.gguf -c 8192 --jinja

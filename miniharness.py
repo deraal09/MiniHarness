@@ -990,7 +990,7 @@ def _fmt_call(c):
 # ------------------------------------------------- config file + server
 CONFIG_NAME = "miniharness.ini"
 HARNESS_KEYS = {"dir", "url", "model", "api_key", "ctx", "max_tokens", "protocol",
-                "temperature", "max_steps", "summarize", "auto_approve", "footer"}
+                "temperature", "max_steps", "summarize", "auto_approve", "footer", "banner"}
 SERVER_KEYS = {"start", "type", "command", "model", "hf_repo", "host", "port", "args",
                "timeout", "log", "gpu_layers", "threads", "tool_parser"}
 
@@ -1019,6 +1019,8 @@ max_steps = 20
 summarize = true
 # Apply file changes without asking.
 auto_approve = false
+# Clear the screen and show the ASCII-art logo at start.
+banner = true
 # Status bar on the last terminal line with live time, speed, context and CPU/GPU load.
 footer = true
 
@@ -1539,6 +1541,38 @@ def setup_completion(get_files):
         pass
 
 
+# ------------------------------------------------------------------ banner
+LOGO = r"""
+ __  __ _       _ _   _
+|  \/  (_)_ __ (_) | | | __ _ _ __ _ __   ___  ___ ___
+| |\/| | | '_ \| | |_| |/ _` | '__| '_ \ / _ \/ __/ __|
+| |  | | | | | | |  _  | (_| | |  | | | |  __/\__ \__ \
+|_|  |_|_|_| |_|_|_| |_|\__,_|_|  |_| |_|\___||___/___/
+""".strip("\n")
+TAGLINE = "for local LLM"
+
+
+def banner_text(cols, color=False):
+    """The start screen header: ASCII-art logo + tagline (plain one-liner on narrow terminals)."""
+    width = max(len(ln) for ln in LOGO.split("\n"))
+    if cols < width + 1:
+        lines = ["MiniHarness - " + TAGLINE]
+    else:
+        lines = LOGO.split("\n") + [TAGLINE.rjust(width)]
+    text = "\n".join(lines)
+    return (("\033[1;36m%s\033[0m" % text) if color else text) + "\n"
+
+
+def show_banner():
+    """Clear the terminal (not the scrollback) and print the logo. Terminals only."""
+    if not sys.stdout.isatty():
+        return
+    if os.name == "nt":
+        os.system("")                   # enable VT sequences in the Windows console
+    cols = shutil.get_terminal_size()[0]
+    _w("\033[2J\033[H" + banner_text(cols, Term.color) + "\n")
+
+
 # --------------------------------------------------------------------- cli
 HELP = """\
 /ctx [n]    show / set context window (tokens)
@@ -1605,6 +1639,8 @@ def parse_args(argv=None):
                     help="drop old messages without summarizing them")
     ap.add_argument("-y", "--yes", action="store_true", default=d(None, "auto_approve", False, _bool),
                     help="apply file changes without asking")
+    ap.add_argument("--no-banner", dest="banner", action="store_false", default=d(None, "banner", True, _bool),
+                    help="don't clear the screen / show the logo at start")
     ap.add_argument("--no-footer", dest="footer", action="store_false", default=d(None, "footer", True, _bool),
                     help="no pinned status bar (just a live line while waiting)")
     ap.add_argument("-p", "--prompt", help="run a single prompt and exit")
@@ -1624,6 +1660,8 @@ def main(argv=None):
         say("created %s - edit it (model path!), then just run: python %s" %
             (target, Path(sys.argv[0]).name))
         return
+    if args.banner and not args.prompt:
+        show_banner()
     srv = None
     if not args.no_server:
         srv = server_settings(args.conf, args.url, args.ctx or DEFAULT_CTX, args.protocol)

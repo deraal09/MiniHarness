@@ -494,5 +494,22 @@ class FooterTests(unittest.TestCase):
         tk.stop()
 
 
+class BannerTests(unittest.TestCase):
+    def test_banner_is_ascii_and_fits(self):
+        wide = mh.banner_text(100)
+        self.assertTrue(wide.isascii())
+        self.assertIn("for local LLM", wide)
+        self.assertIn("|_|  |_|_|_| |_|_|_| |_|", wide)             # last logo row
+        self.assertLessEqual(max(len(ln) for ln in wide.split("\n")), 100)
+        self.assertEqual(mh.banner_text(30), "MiniHarness - for local LLM\n")    # narrow terminal
+        self.assertTrue(mh.banner_text(100, color=True).startswith("\033[1;36m"))
+
+    def test_banner_only_on_terminal(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mh.show_banner()
+        self.assertEqual(buf.getvalue(), "")                        # not a tty: nothing, no clear codes
+
+
 if __name__ == "__main__":
     unittest.main()
