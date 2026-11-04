@@ -678,6 +678,7 @@ class Agent:
         self.msgs, self.summary = [], ""
         self.ratio = 3.0            # chars per token, calibrated from server usage
         self.used = 0               # tokens of the last request (prompt + reply)
+        self.base, self.base_exact = 0, False   # tokens the harness itself occupies (system prompt + tools)
         self.ctx_guess = False      # n_ctx is only a default guess -> ask the server after 1st reply
         self.ticker = Ticker(live=False)
         self.perf = {"prompt_s": 0.0, "gen_s": 0.0, "tokens": 0}   # per turn: prompt wait, generation
@@ -792,7 +793,33 @@ class Agent:
             say(dim("[summary failed: %s]" % e))
 
     def clear(self):
-        self.msgs, self.summary, self.used = [], "", 0
+        self.msgs, self.summary, self.used = [], "", self.base
+
+    def measure_base(self):
+        """Tokens the harness occupies before the conversation starts (system prompt, tool definitions,
+        chat template). Asked from the server with a 1-token request; estimated if that fails."""
+        probe = [{"role": "user", "content": "hi"}]
+        chars = self.chars(probe)
+        pt = None
+        try:
+            res = self.client.chat([{"role": "system", "content": self.system()}] + probe,
+                                   TOOL_SPECS if self.native else None, 1, 0.0)
+            pt = res["prompt_tokens"]
+        except LLMError:
+            pass
+        if pt:
+            self.ratio = min(6.0, max(1.5, chars / pt))     # first real calibration of chars per token
+            self.base, self.base_exact = pt, True
+        else:
+            self.base, self.base_exact = int(chars / self.ratio), False
+        self.used = self.base
+        return self.base
+
+    def base_text(self):
+        free = max(0, self.budget() - self.base)
+        return "harness (system prompt + tools) uses %s%d/%d tokens (%d%%) · reply reserve %d · %d free" % (
+            "" if self.base_exact else "~", self.base, self.n_ctx, 100 * self.base // max(1, self.n_ctx),
+            self.reserve, free)
 
     def compact(self):
         old, self.msgs = self.msgs, []
@@ -1674,10 +1701,15 @@ def _run(args, client, root):
     say(paint("1", "miniharness") + dim(" · %s · model %s · folder %s · context %d tokens (%s) · reply reserve %d" %
                                         (args.url, client.model, agent.tools.root, n_ctx, src, agent.reserve)))
     agent.ctx_guess = not args.ctx and not detected
-    fixed = agent.chars([]) / agent.ratio
-    if fixed > 0.4 * agent.budget():
-        say(paint("33", "warning: system prompt + tools use ~%d of %d tokens; "
-                        "try --protocol text or a larger context" % (fixed, n_ctx)))
+    if sys.stdout.isatty():
+        _w(dim("measuring context use of the harness ...") )
+    agent.measure_base()
+    if sys.stdout.isatty():
+        _w("\r\033[K")
+    say(dim("context: " + agent.base_text()))
+    if agent.base > 0.4 * agent.budget():
+        say(paint("33", "warning: the harness takes a large part of the context; "
+                        "try --protocol text or a larger context"))
 
     mon = HwMonitor()
     hw = mon.describe()
@@ -1783,6 +1815,7 @@ def _run(args, client, root):
                     agent.n_ctx = int(arg)
                 say("context %d tokens, last request used ~%d (%d%%)" %
                     (agent.n_ctx, agent.used, 100 * agent.used // max(1, agent.n_ctx)))
+                say(agent.base_text())
             else:
                 say("unknown command, see /help")
             continue

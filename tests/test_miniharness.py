@@ -231,6 +231,25 @@ class EndToEnd(Base):
         self.assertGreaterEqual(a.perf["prompt_s"], 0.25)
         self.assertIn("prompt 0.", a.perf_text())
 
+    def test_measure_base(self):
+        a = mh.Agent(mh.parse_args(["--dir", str(self.root)]), mh.Client(self.url), self.tools, 2048)
+        self.assertEqual(a.measure_base(), 100)               # fake server reports 100 prompt tokens
+        self.assertTrue(a.base_exact)
+        self.assertEqual(FakeLLM.requests[-1]["max_tokens"], 1)
+        self.assertIn("tools", FakeLLM.requests[-1])
+        self.assertEqual(a.used, 100)
+        self.assertTrue(1.5 <= a.ratio <= 6.0)
+        self.assertIn("uses 100/2048 tokens (4%)", a.base_text())
+        a.msgs.append({"role": "user", "content": "x"})
+        a.clear()
+        self.assertEqual(a.used, 100)                         # back to the baseline
+
+    def test_measure_base_falls_back_to_estimate(self):
+        a = mh.Agent(mh.parse_args(["--dir", str(self.root)]), mh.Client("http://127.0.0.1:1/v1"), self.tools, 2048)
+        self.assertGreater(a.measure_base(), 200)
+        self.assertFalse(a.base_exact)
+        self.assertIn("uses ~", a.base_text())
+
     def test_tool_loop_text(self):
         (self.root / "n.txt").write_text("abc\n")
         FakeLLM.script = [{"content": 'TOOL: {"name": "read_file", "arguments": {"path": "n.txt"}}'},

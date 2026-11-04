@@ -171,6 +171,18 @@ python miniharness.py --url http://127.0.0.1:11434/v1 -m qwen2.5-coder:7b --ctx 
 
 ## Kontextfenster
 
+Beim Start misst das Harness, wie viel vom Fenster es selbst belegt (System-Prompt + Tool-Definitionen + Chat-Template),
+und zeigt es an:
+
+```
+context: harness (system prompt + tools) uses 612/8192 tokens (7%) · reply reserve 2048 · 5468 free
+```
+
+Der Wert kommt von einer 1-Token-Testanfrage an den Server (`prompt_tokens`), ist also exakt; ist der Server dafür nicht
+erreichbar, wird geschätzt und mit `~` markiert. Zugleich kalibriert die Messung die Tokenschätzung (Zeichen pro Token).
+Die Statusleiste startet mit diesem Wert, `/ctx` zeigt ihn jederzeit. Belegt das Harness mehr als 40 % des
+nutzbaren Fensters, erscheint eine Warnung (Abhilfe: `--protocol text` oder größeres Fenster).
+
 Reihenfolge, in der die Größe bestimmt wird:
 
 1. `--ctx N` bzw. Umgebungsvariable `MINIHARNESS_CTX`
