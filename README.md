@@ -44,10 +44,24 @@ python miniharness.py --url http://127.0.0.1:8000/v1
 ## Config-Datei: Server automatisch starten
 
 ```bash
-python miniharness.py --init      # legt eine kommentierte miniharness.ini an
-# ini anpassen (mindestens [server] model = Pfad/zur/datei.gguf), dann nur noch:
+python miniharness.py --init      # fragt kurz nach der Umgebung und legt eine vorausgefüllte miniharness.ini an
+python miniharness.py --init ollama   # ohne Rückfrage: llama.cpp | ollama | vllm | other
+# Felder bei Bedarf anpassen, dann nur noch:
 python miniharness.py
 ```
+
+`--init` fragt nur, welche Umgebung Sie nutzen (llama.cpp, Ollama, vLLM oder ein schon laufender Server wie LM Studio),
+und füllt die passenden Felder vor – Typ, Port, Kontext, Start-Timeout, Tool-Parser:
+
+- **llama.cpp:** sucht eine `.gguf`-Datei (aktueller Ordner, `./models`, `~/models`, `~/.cache/llama.cpp`, `~/Downloads`)
+  und trägt sie als `model` ein; warnt, wenn `llama-server` nicht im PATH liegt.
+- **Ollama:** trägt das erste installierte Modell ein (vom laufenden Server oder aus `ollama list`), sonst einen Vorschlag
+  mit dem passenden `ollama pull`.
+- **vLLM:** `Qwen/Qwen2.5-7B-Instruct`, Port 8000, `tool_parser = hermes`, Timeout 600 s.
+- **Schon laufender Server:** fragt nach der URL (Vorschlag `http://127.0.0.1:1234/v1`), startet nichts
+  (`start = false`) und lässt `ctx` leer, damit die Größe vom Server gelesen wird.
+
+Ohne Terminal (Pipe/Skript) wird nicht gefragt; dann gilt `llama.cpp`, falls kein Name übergeben wurde.
 
 Die Datei wird in dieser Reihenfolge gesucht: `--config PFAD`, `MINIHARNESS_CONFIG`, aktueller Ordner,
 Ordner des Skripts. Relative Pfade in der Datei gelten relativ zur Datei. Vorrang: Kommandozeile >
@@ -117,6 +131,8 @@ Auf einem echten Terminal bleibt die **letzte Zeile fest stehen** (der Text scro
 - Abschalten mit `--no-footer` oder `footer = false` in der Config. Dann gibt es nur eine Live-Zeile, solange noch
   kein Text erscheint, und nach jeder Nachricht eine Statuszeile `[context … · 14.8s (prompt 9.6s, 18.2 tok/s) · …]`.
 - Ohne Terminal (Pipe, Datei, `TERM=dumb`) und bei weniger als 8 Zeilen Höhe wird keine Leiste gezeichnet.
+- Ändern Sie die Fenstergröße, zeichnet das Harness die Leiste sofort neu (Terminals vergessen dabei den festen
+  Bereich); zusätzlich wird er bei jeder Aktualisierung erneut gesetzt.
   Beim Beenden (auch bei Strg+C oder Absturz) wird sie wieder entfernt; sollte das Terminal einmal durcheinander
   sein, hilft `reset`.
 

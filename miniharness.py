@@ -469,44 +469,63 @@ def _w(text):
 
 class Footer:
     """Status bar pinned to the last terminal line (scroll region), updated live.
-    Only active on a real terminal; everything else keeps scrolling above it."""
+    Only active on a real terminal; everything else keeps scrolling above it.
+
+    Terminals reset the scroll region when they are resized, so the region is set again on every
+    redraw, and a watcher thread repaints at once when the terminal size changes."""
 
     def __init__(self):
-        self.on, self.rows, self.text_fn, self.lock = False, 0, lambda: "", threading.Lock()
+        self.on, self.size, self.text_fn, self.lock = False, (0, 0), lambda: "", threading.RLock()
 
     def enable(self, text_fn):
         if self.on or not (sys.stdout.isatty() and sys.stdin.isatty()) or os.environ.get("TERM") == "dumb":
             return False
-        rows = shutil.get_terminal_size()[1]
-        if rows < 8:
+        if shutil.get_terminal_size()[1] < 8:
             return False
         if os.name == "nt":
             os.system("")                   # enable VT sequences in the Windows console
-        self.text_fn, self.rows, self.on = text_fn, rows, True
-        # make room for one line, then keep scrolling above it: save cursor, set region, restore
-        _w("\n\033[1A\0337\033[1;%dr\0338" % (rows - 1))
-        atexit.register(self.disable)
+        self.text_fn, self.size, self.on = text_fn, tuple(shutil.get_terminal_size()), True
+        _w("\n\033[1A")                    # make room: the cursor leaves the last row
         self.draw()
+        atexit.register(self.disable)
+        threading.Thread(target=self.watch, daemon=True).start()
         return True
 
-    def draw(self):
-        if not self.on:
-            return
+    def watch(self):
+        while self.on:
+            time.sleep(0.3)
+            if self.on and tuple(shutil.get_terminal_size()) != self.size:
+                self.reflow()
+
+    def reflow(self):
+        """The terminal was resized: it dropped the scroll region and may have put the cursor on the
+        last row. Scroll once so the cursor is above the bar, then paint everything again."""
         with self.lock:
-            cols, rows = shutil.get_terminal_size()
-            pre = ""
-            if rows != self.rows:           # terminal was resized
-                pre, self.rows = "\0337\033[1;%dr\0338" % (rows - 1), rows
-            try:
-                text = self.text_fn() or ""
-            except Exception:               # a status bar must never take the program down
-                text = ""
-            _w(pre + "\0337\033[%d;1H\033[2K\033[7m%s\033[0m\0338" % (rows, text[:cols - 1].ljust(cols - 1)))
+            self.size = tuple(shutil.get_terminal_size())
+            _w("\n\033[1A")
+            self.paint()
+
+    def draw(self):
+        if self.on:
+            with self.lock:
+                self.paint()
+
+    def paint(self):
+        cols, rows = shutil.get_terminal_size()
+        try:
+            text = self.text_fn() or ""
+        except Exception:                   # a status bar must never take the program down
+            text = ""
+        # save cursor; (re)set the scroll region above the bar; draw the bar; restore cursor
+        _w("\0337\033[1;%dr\033[%d;1H\033[2K\033[7m%s\033[0m\0338" %
+           (rows - 1, rows, text[:cols - 1].ljust(cols - 1)))
 
     def disable(self):
-        if self.on:
-            self.on = False
-            _w("\0337\033[r\033[%d;1H\033[2K\0338" % self.rows)
+        with self.lock:
+            if self.on:
+                self.on = False
+                rows = shutil.get_terminal_size()[1]
+                _w("\0337\033[r\033[%d;1H\033[2K\0338" % rows)
 
 
 FOOTER = Footer()
@@ -1573,6 +1592,133 @@ def show_banner():
     _w("\033[2J\033[H" + banner_text(cols, Term.color) + "\n")
 
 
+# ----------------------------------------------------------- --init wizard
+ENVIRONMENTS = [
+    ("llama.cpp", "llama.cpp (llama-server with a .gguf model file)"),
+    ("ollama", "Ollama"),
+    ("vllm", "vLLM"),
+    ("other", "A server that already runs (LM Studio, another machine, ...)"),
+]
+
+
+SHORT = {"llama.cpp": "llama.cpp", "ollama": "Ollama", "vllm": "vLLM", "other": "an already running server"}
+
+
+def render_template(overrides, header=""):
+    """TEMPLATE with some values filled in: overrides = {(section, key): value}."""
+    out, section = [], ""
+    for ln in TEMPLATE.split("\n"):
+        m = re.match(r"\[(\w+)\]", ln)
+        if m:
+            section = m.group(1)
+        kv = re.match(r"(\w+) =", ln)
+        if kv and (section, kv.group(1)) in overrides:
+            ln = ("%s = %s" % (kv.group(1), overrides[(section, kv.group(1))])).rstrip()
+        out.append(ln)
+    return (header + "\n" if header else "") + "\n".join(out)
+
+
+def find_gguf(dirs=None):
+    """First .gguf file in the usual places (current folder, ./models, ~/models, llama.cpp's cache)."""
+    home = Path.home()
+    for d in dirs or [Path.cwd(), Path.cwd() / "models", Path(__file__).resolve().parent / "models",
+                      home / "models", home / ".cache" / "llama.cpp", home / "Downloads"]:
+        try:
+            hits = sorted(Path(d).glob("*.gguf"))
+        except OSError:
+            continue
+        if hits:
+            return str(hits[0])
+    return ""
+
+
+def ollama_models(base="http://127.0.0.1:11434"):
+    """Names of the installed Ollama models (running server first, `ollama list` as fallback)."""
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(base + "/api/tags", timeout=1.5) as r:
+            return [m["name"] for m in json.loads(r.read().decode("utf-8")).get("models", []) if m.get("name")]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    exe = shutil.which("ollama")
+    if exe:
+        try:
+            out = subprocess.run([exe, "list"], capture_output=True, text=True, timeout=5, **_quiet()).stdout
+            return [ln.split()[0] for ln in out.splitlines()[1:] if ln.strip()]
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return []
+
+
+def choose_environment(choice, ask):
+    """choice: name given on the command line ('' = ask). -> key from ENVIRONMENTS."""
+    keys = [k for k, _ in ENVIRONMENTS]
+    aliases = {"llama": "llama.cpp", "llamacpp": "llama.cpp", "llama-server": "llama.cpp", "lmstudio": "other",
+               "server": "other", "existing": "other", "lm studio": "other"}
+    while True:
+        if not choice and ask:
+            say("Which environment do you want to use?")
+            for i, (_, label) in enumerate(ENVIRONMENTS, 1):
+                say("  %d) %s" % (i, label))
+            try:
+                choice = ask("number or name [1]: ").strip().lower() or "1"
+            except EOFError:
+                choice = "1"
+        choice = (choice or "1").strip().lower()
+        if choice.isdigit() and 1 <= int(choice) <= len(keys):
+            return keys[int(choice) - 1]
+        choice = aliases.get(choice, choice)
+        if choice in keys:
+            return choice
+        if not ask:
+            sys.exit("unknown environment '%s' (use one of: %s)" % (choice, ", ".join(keys)))
+        say("please enter 1-%d or a name" % len(keys))
+        choice = ""
+
+
+def build_config(env, ask=None, url=""):
+    """-> (config text, notes) for the chosen environment, fields pre-filled so they only need tweaking."""
+    notes, ov = [], {}
+    ov[("harness", "ctx")] = "8192"
+    if env == "llama.cpp":
+        gguf = find_gguf()
+        ov.update({("server", "start"): "true", ("server", "type"): "llama.cpp", ("server", "port"): "8080",
+                   ("server", "model"): gguf or "/path/to/model.gguf"})
+        notes.append("model: " + (gguf + " (found)" if gguf else "no .gguf found - set [server] model (or hf_repo)"))
+        if not shutil.which("llama-server"):
+            notes.append("llama-server is not in PATH - install llama.cpp or set [server] command")
+    elif env == "ollama":
+        models = ollama_models()
+        ov.update({("server", "start"): "true", ("server", "type"): "ollama", ("server", "port"): "11434",
+                   ("server", "model"): models[0] if models else "qwen2.5-coder:7b"})
+        notes.append("model: " + (models[0] + " (installed)" + (", %d more" % (len(models) - 1) if len(models) > 1 else "")
+                                  if models else "none installed yet - run: ollama pull qwen2.5-coder:7b"))
+        notes.append("if Ollama is already running its own context setting applies "
+                     "(set OLLAMA_CONTEXT_LENGTH there)")
+        if not shutil.which("ollama") and not models:
+            notes.append("Ollama was not found - install it from ollama.com")
+    elif env == "vllm":
+        ov.update({("server", "start"): "true", ("server", "type"): "vllm", ("server", "port"): "8000",
+                   ("server", "model"): "Qwen/Qwen2.5-7B-Instruct", ("server", "timeout"): "600"})
+        notes.append("model: Qwen/Qwen2.5-7B-Instruct (Hugging Face id, downloaded by vLLM) - change as needed")
+        notes.append("tool_parser = hermes fits Qwen2.5/3; other models need another parser")
+        if not shutil.which("vllm"):
+            notes.append("vllm is not in PATH - install it, or set [server] command (e.g. wsl vllm)")
+    else:
+        default = "http://127.0.0.1:1234/v1"
+        if not url and ask:
+            try:
+                url = ask("server URL [%s]: " % default).strip()
+            except EOFError:
+                url = ""
+        url = url or default
+        ov.update({("server", "start"): "false", ("harness", "url"): url, ("harness", "ctx"): "",
+                   ("server", "model"): "", ("server", "port"): ""})
+        notes.append("url: %s - context size is read from the server (set [harness] ctx to override)" % url)
+    header = "# Created by `miniharness --init` for: %s\n#" % SHORT[env]
+    return render_template(ov, header), notes
+
+
 # --------------------------------------------------------------------- cli
 HELP = """\
 /ctx [n]    show / set context window (tokens)
@@ -1618,7 +1764,9 @@ def parse_args(argv=None):
         description="Small agent harness for local LLMs (llama.cpp, Ollama, OpenAI-compatible APIs).")
     ap.add_argument("--config", help="config file (default: %s in the current folder or next to the script)"
                     % CONFIG_NAME)
-    ap.add_argument("--init", action="store_true", help="write a template %s here and exit" % CONFIG_NAME)
+    ap.add_argument("--init", nargs="?", const="", metavar="ENV",
+                    help="write a pre-filled %s here and exit; ENV = llama.cpp | ollama | vllm | other "
+                         "(asked if omitted)" % CONFIG_NAME)
     ap.add_argument("--no-server", action="store_true", help="don't start the server from the config")
     ap.add_argument("-d", "--dir", default=d(None, "dir", "."), help="project folder the model may read/edit (default: .)")
     ap.add_argument("-u", "--url", default=d("MINIHARNESS_URL", "url", ""),
@@ -1652,13 +1800,21 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     Term.setup()
-    if args.init:
+    if args.init is not None:
         target = Path(CONFIG_NAME)
         if target.exists():
             sys.exit("%s already exists" % target)
-        target.write_text(TEMPLATE, encoding="utf-8")
-        say("created %s - edit it (model path!), then just run: python %s" %
-            (target, Path(sys.argv[0]).name))
+        ask = input if sys.stdin.isatty() else None
+        try:
+            env = choose_environment(args.init, ask)
+            text, notes = build_config(env, ask, args.url)
+        except (KeyboardInterrupt, EOFError):
+            sys.exit("\ncancelled")
+        target.write_text(text, encoding="utf-8")
+        say(paint("32", "created %s for %s" % (target, SHORT[env])))
+        for n in notes:
+            say("  - " + n)
+        say("adjust what you need in the file, then just run: python %s" % Path(sys.argv[0]).name)
         return
     if args.banner and not args.prompt:
         show_banner()

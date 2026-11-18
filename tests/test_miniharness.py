@@ -38,6 +38,8 @@ class FakeLLM(BaseHTTPRequestHandler):
             return self.reply_json({"detail": "Not Found"}, 404)
         if not self.ollama:
             return self.reply_json({"default_generation_settings": {"n_ctx": self.n_ctx}})
+        if self.path == "/api/tags":
+            return self.reply_json({"models": [{"name": "qwen2.5-coder:7b"}, {"name": "llama3.2:3b"}]})
         if self.path == "/api/ps":
             return self.reply_json({"models": [{"name": "qwen:7b", "context_length": 8192}]})
         if self.path == "/v1/models":
@@ -191,6 +193,11 @@ class EndToEnd(Base):
         a.run_turn("hi")
         self.assertEqual(a.n_ctx, 3000)
         self.assertEqual(a.msgs[-1]["content"], "ok")
+
+    def test_installed_models_from_running_server(self):
+        FakeLLM.ollama = True
+        self.addCleanup(setattr, FakeLLM, "ollama", False)
+        self.assertEqual(mh.ollama_models(self.url.rsplit("/v1", 1)[0]), ["qwen2.5-coder:7b", "llama3.2:3b"])
 
     def test_ollama(self):
         FakeLLM.ollama = True
@@ -468,16 +475,31 @@ class FooterTests(unittest.TestCase):
         from unittest import mock
         buf = io.StringIO()
         f = mh.Footer()
-        f.on, f.rows, f.text_fn = True, 24, lambda: " 1.0s  generating"
+        f.on, f.size, f.text_fn = True, (80, 24), lambda: " 1.0s  generating"
         with contextlib.redirect_stdout(buf), mock.patch("shutil.get_terminal_size", return_value=(80, 24)):
             f.draw()
             first = buf.getvalue()
             f.disable()
-        self.assertIn("\0337\033[24;1H", first)            # save cursor, jump to the last row
+        self.assertIn("\033[1;23r", first)                   # scroll region above the bar, set on every draw
+        self.assertIn("\033[24;1H", first)                  # bar on the last row
         self.assertIn("1.0s  generating", first)
         self.assertTrue(first.endswith("\0338"))            # cursor restored
         self.assertIn("\033[r", buf.getvalue()[len(first):])  # scroll region reset on exit
         self.assertFalse(f.on)
+
+    def test_footer_resize_repaints_with_new_region(self):
+        from unittest import mock
+        buf = io.StringIO()
+        f = mh.Footer()
+        f.on, f.size, f.text_fn = True, (80, 24), lambda: " bar"
+        with contextlib.redirect_stdout(buf), mock.patch("shutil.get_terminal_size", return_value=(120, 40)):
+            f.reflow()
+        out = buf.getvalue()
+        self.assertTrue(out.startswith("\n\033[1A"))         # cursor moved off the last row first
+        self.assertIn("\033[1;39r", out)                    # region for the new height
+        self.assertIn("\033[40;1H", out)                    # bar moved to the new last row
+        self.assertEqual(f.size, (120, 40))
+        f.on = False
 
     def test_footer_disabled_without_tty(self):
         self.assertFalse(mh.Footer().enable(lambda: ""))
@@ -509,6 +531,56 @@ class BannerTests(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             mh.show_banner()
         self.assertEqual(buf.getvalue(), "")                        # not a tty: nothing, no clear codes
+
+
+class InitWizardTests(Base):
+    def parse(self, text):
+        path = self.root / "miniharness.ini"
+        path.write_text(text, encoding="utf-8")
+        return mh.Config(path)
+
+    def test_every_environment_yields_a_valid_prefilled_config(self):
+        for env, kind, port in (("llama.cpp", "llama.cpp", 8080), ("ollama", "ollama", 11434),
+                                ("vllm", "vllm", 8000)):
+            text, notes = mh.build_config(env)
+            conf = self.parse(text)
+            srv = mh.server_settings(conf, "", int(conf.h["ctx"]), "native")
+            self.assertEqual((srv["type"], srv["port"]), (kind, port), env)
+            self.assertTrue(mh.server_command(srv)[0], env)             # command can be built as-is
+            self.assertIn("[server]", text)
+            self.assertIn("# Created by `miniharness --init` for", text)
+            self.assertTrue(notes)
+        self.assertIn("-m", mh.server_command(mh.server_settings(
+            self.parse(mh.build_config("llama.cpp")[0]), "", 8192, "native"))[0])
+
+    def test_existing_server_asks_for_url_and_starts_nothing(self):
+        text, notes = mh.build_config("other", ask=lambda prompt: "http://10.0.0.5:1234/v1")
+        conf = self.parse(text)
+        self.assertEqual(conf.h["url"], "http://10.0.0.5:1234/v1")
+        self.assertNotIn("ctx", conf.h)                                  # empty: read from the server
+        self.assertIsNone(mh.server_settings(conf, "", 4096, "native"))  # start = false
+        text, _ = mh.build_config("other", ask=None, url="http://x:1/v1")
+        self.assertEqual(self.parse(text).h["url"], "http://x:1/v1")
+
+    def test_choose_environment(self):
+        answers = iter(["nonsense", "3"])
+        self.assertEqual(mh.choose_environment("", lambda p: next(answers)), "vllm")
+        self.assertEqual(mh.choose_environment("", lambda p: ""), "llama.cpp")        # Enter = default
+        self.assertEqual(mh.choose_environment("Ollama", None), "ollama")             # from the command line
+        self.assertEqual(mh.choose_environment("lmstudio", None), "other")
+        with self.assertRaises(SystemExit):
+            mh.choose_environment("nope", None)
+
+    def test_detection(self):
+        (self.root / "models").mkdir()
+        (self.root / "models" / "b.gguf").write_text("x")
+        (self.root / "models" / "a.gguf").write_text("x")
+        self.assertEqual(mh.find_gguf([self.root, self.root / "models"]), str(self.root / "models" / "a.gguf"))
+        self.assertEqual(mh.find_gguf([self.root / "nothing"]), "")
+        text = mh.render_template({("server", "model"): "x.gguf", ("harness", "ctx"): "2048"})
+        conf = self.parse(text)
+        self.assertEqual((conf.s["model"], conf.h["ctx"]), ("x.gguf", "2048"))
+        self.assertIn("# Folder the model may read and edit.", text)               # comments survive
 
 
 if __name__ == "__main__":
