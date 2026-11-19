@@ -98,6 +98,27 @@ args = --n-gpu-layers 99
 - Serverausgabe steht in `miniharness-server.log`; startet der Server nicht, werden die letzten Zeilen gezeigt.
 - `--no-server` ignoriert den `[server]`-Abschnitt. Für Zugriff aus dem Netz `host = 0.0.0.0` setzen.
 
+## Fehler-Rückkopplung (Selbstkorrektur)
+
+Das Harness meldet dem Modell Fehler zurück, damit es sie selbst behebt:
+
+- **Syntaxprüfung nach Änderungen:** Hat das Modell in einer Nachricht Dateien geschrieben oder bearbeitet, werden sie am Ende
+  geparst (`.py`, `.json`, `.ini`/`.cfg`, `.toml`, `.xml`; es wird nichts ausgeführt). Gefundene Fehler gehen als
+  „automatic check“-Nachricht mit Datei und Zeile zurück ans Modell, das sie korrigiert. Geprüft wird erst am Ende, damit
+  Dateien, die in Teilen (`append`) geschrieben werden, nicht zwischendurch als „kaputt“ gemeldet werden.
+- **Eigener Prüfbefehl (optional):** `check = python -m pytest -q` (Config) bzw. `--check "…"`. Er läuft nach Änderungen im
+  Projektordner (über die Shell, Zeitlimit `check_timeout`, Standard 60 s); schlägt er fehl, geht das Ende der Ausgabe
+  (Fehler und Zusammenfassung) ans Modell. Beispiele: `python -m py_compile app.py`, `npm test`, `ruff check .`.
+- **Begrenzt:** höchstens `check_rounds` Korrekturversuche pro Nachricht (Standard 3); danach bleibt es beim Hinweis an Sie.
+  Ohne Änderungen wird nichts geprüft. Abschalten der Syntaxprüfung: `--no-syntax-check` / `syntax_check = false`.
+- **Wiederholte Tool-Fehler:** Ruft das Modell denselben fehlgeschlagenen Tool-Aufruf nochmal auf, bekommt es den Hinweis,
+  anders vorzugehen; nach 5 Fehlern in Folge bricht das Harness ab (statt in einer Schleife weiterzulaufen).
+  Fehler werden rot angezeigt, ungültige Tool-Aufrufe (kaputtes JSON, unbekannte Tools, falsche Argumente) gehen ebenfalls
+  als Fehlermeldung zurück.
+- **Sicherheit:** Der Prüfbefehl steht in *Ihrer* Config. Deshalb darf das Modell `miniharness.ini` und das Server-Log weder
+  lesen noch ändern (sie werden auch in Listen und der Suche ausgeblendet) – sonst könnte es sich über den Prüf- oder
+  Server-Befehl selbst Code ausführen lassen.
+
 ## Dateien auflisten und per @ anhängen
 
 Beim Start zeigt das Programm, wie viele Dateien im Ordner liegen (Binärdateien wie Bilder, PDFs, `.gguf` und

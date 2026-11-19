@@ -164,6 +164,48 @@ class AgentTests(Base):
         self.assertIn("error", mh.parse_text_calls('TOOL: {"name": "x", "argu')[0])
 
 
+class FeedbackTests(Base):
+    def test_syntax_error_detection(self):
+        self.assertIsNone(mh.syntax_error("a.py", "def f():\n    return 1\n"))
+        self.assertIn("line 1", mh.syntax_error("a.py", "def f(:\n    pass\n"))
+        self.assertIn("line 1, column", mh.syntax_error("a.json", '{"a": }'))
+        self.assertIsNone(mh.syntax_error("a.json", '{"a": 1}'))
+        self.assertIsNotNone(mh.syntax_error("a.ini", "no section header\n"))
+        self.assertIsNone(mh.syntax_error("a.ini", "[s]\nk = v\n"))
+        self.assertIn("line", mh.syntax_error("a.xml", "<a><b></a>"))
+        self.assertIsNone(mh.syntax_error("notes.txt", "def f(:"))          # unknown type: never flagged
+        self.assertIsNone(mh.syntax_error("a.py", "x = 1"))
+
+    def test_run_check(self):
+        ok, out = mh.run_check('"%s" -c "print(1)"' % sys.executable, self.root, 10, 500)
+        self.assertEqual((ok, out), (True, "1"))
+        ok, out = mh.run_check('"%s" -c "import sys; print(\'boom\' * 400); sys.exit(2)"' % sys.executable,
+                               self.root, 10, 100)
+        self.assertFalse(ok)
+        self.assertTrue(out.startswith("...[cut]"))
+        self.assertTrue(out.endswith("boom"))                                # the tail is kept
+        ok, out = mh.run_check('"%s" -c "import time; time.sleep(5)"' % sys.executable, self.root, 1, 100)
+        self.assertEqual((ok, "did not finish" in out), (False, True))
+
+    def test_config_is_protected_from_the_model(self):
+        (self.root / "miniharness.ini").write_text("[server]\ncommand = evil\n")
+        (self.root / "other.cfg").write_text("x")
+        for fn in (lambda: self.tools.write_file("miniharness.ini", "[server]\n"),
+                   lambda: self.tools.read_file("miniharness.ini"),
+                   lambda: self.tools.edit_file("miniharness.ini", "evil", "worse"),
+                   lambda: self.tools.write_file("sub/../MiniHarness.INI", "x")):
+            with self.assertRaises(mh.ToolError):
+                fn()
+        self.tools.protected.add((self.root / "other.cfg").resolve())
+        with self.assertRaises(mh.ToolError):
+            self.tools.read_file("other.cfg")
+        self.assertNotIn("miniharness.ini", self.tools.list_files("."))
+        self.assertNotIn("miniharness.ini", self.tools.list_files(".", recursive=True))
+        self.assertNotIn("miniharness.ini", self.tools.search("command"))
+        self.assertNotIn("miniharness.ini", mh.project_files(self.tools))
+        self.assertIn("evil", (self.root / "miniharness.ini").read_text())    # untouched
+
+
 class EndToEnd(Base):
     def setUp(self):
         super().setUp()
@@ -237,6 +279,60 @@ class EndToEnd(Base):
         a.run_turn("hello")
         self.assertGreaterEqual(a.perf["prompt_s"], 0.25)
         self.assertIn("prompt 0.", a.perf_text())
+
+    def make_agent(self, *extra):
+        a = mh.Agent(mh.parse_args(["--dir", str(self.root), "-y", *extra]), mh.Client(self.url), self.tools, 4096)
+        return a
+
+    def user_texts(self, req):
+        return [m["content"] for m in req["messages"] if m["role"] == "user"]
+
+    def test_syntax_error_is_fed_back_and_fixed(self):
+        FakeLLM.script = [{"tool": ("write_file", {"path": "bad.py", "content": "def f(:\n    pass\n"})},
+                          {"content": "fertig"},
+                          {"tool": ("edit_file", {"path": "bad.py", "old": "def f(:", "new": "def f():"})},
+                          {"content": "jetzt ok"}]
+        a = self.make_agent()
+        a.run_turn("write bad.py")
+        self.assertEqual(len(FakeLLM.requests), 4)
+        report = [x for x in self.user_texts(FakeLLM.requests[2]) if "automatic check" in x]
+        self.assertEqual(len(report), 1)
+        self.assertIn("Syntax errors:", report[0])
+        self.assertIn("bad.py: line 1", report[0])
+        self.assertEqual((self.root / "bad.py").read_text(), "def f():\n    pass\n")
+        self.assertEqual(a.msgs[-1]["content"], "jetzt ok")
+
+    def test_check_command_loop_and_limit(self):
+        (self.root / "check.py").write_text(
+            "import sys\nsys.exit(0 if open('x.txt').read().strip() == 'ok' else 1)\n")
+        cmd = '"%s" check.py' % sys.executable
+        FakeLLM.script = [{"tool": ("write_file", {"path": "x.txt", "content": "bad"})}, {"content": "done?"},
+                          {"tool": ("write_file", {"path": "x.txt", "content": "ok"})}, {"content": "done"}]
+        a = self.make_agent("--check", cmd)
+        a.run_turn("make x.txt say ok")
+        self.assertEqual(len(FakeLLM.requests), 4)
+        self.assertIn("check command", "\n".join(self.user_texts(FakeLLM.requests[2])))
+        self.assertEqual((self.root / "x.txt").read_text(), "ok")
+        # a check that never passes: the model gets exactly --check-rounds attempts, then we stop
+        FakeLLM.requests, FakeLLM.script = [], [{"tool": ("write_file", {"path": "x.txt", "content": "bad"})}]
+        a = self.make_agent("--check", cmd, "--check-rounds", "2")
+        a.run_turn("again")
+        self.assertEqual(len(FakeLLM.requests), 4)       # write, answer, retry 1, retry 2 -> give up
+
+    def test_no_check_when_nothing_changed(self):
+        FakeLLM.script = [{"content": "just talking"}]
+        a = self.make_agent("--check", '"%s" -c "import sys; sys.exit(1)"' % sys.executable)
+        a.run_turn("hello")
+        self.assertEqual(len(FakeLLM.requests), 1)
+
+    def test_repeated_tool_errors_are_flagged_and_stop(self):
+        FakeLLM.script = [{"tool": ("read_file", {"path": "missing.txt"})}] * 8
+        a = self.make_agent()
+        a.run_turn("read it")
+        self.assertEqual(len(FakeLLM.requests), 5)       # stops after MAX_ERROR_STREAK failures in a row
+        results = [m["content"] for m in a.msgs if m["role"] == "tool"]
+        self.assertNotIn("already failed", results[0])
+        self.assertIn("already failed", results[1])
 
     def test_measure_base(self):
         a = mh.Agent(mh.parse_args(["--dir", str(self.root)]), mh.Client(self.url), self.tools, 2048)

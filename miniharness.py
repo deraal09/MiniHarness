@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ET
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -37,6 +38,7 @@ DEFAULT_CTX = 4096
 MAX_FILE_BYTES = 4_000_000
 BINARY_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".gz", ".tar", ".7z",
               ".exe", ".dll", ".so", ".bin", ".gguf", ".pyc", ".mp3", ".mp4", ".wav", ".sqlite", ".db"}
+PROTECTED_NAMES = {"miniharness.ini", "miniharness-server.log"}   # the model must not touch its own config
 SKIP_DIRS = {".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv"}
 
 
@@ -119,16 +121,23 @@ class Tools:
         self.root = Path(root).resolve()
         self.confirm = confirm      # confirm(title, preview) -> bool
         self.cap = cap              # cap() -> max chars of one tool result
+        self.protected = set()      # resolved paths the model may neither read nor change (config, log)
+        self.changed = set()        # relative paths written during the current turn
         self.table = {s["function"]["name"]: getattr(self, s["function"]["name"])
                       for s in TOOL_SPECS}
 
     # -- helpers
+    def is_protected(self, full):
+        return full in self.protected or full.name.lower() in PROTECTED_NAMES
+
     def resolve(self, p):
         full = (self.root / str(p or ".").strip()).resolve()
         try:
             full.relative_to(self.root)
         except ValueError:
             raise ToolError("path is outside the project folder")
+        if self.is_protected(full):
+            raise ToolError("'%s' is protected (miniharness's own config/log)" % full.name)
         return full
 
     def rel(self, full):
@@ -165,7 +174,8 @@ class Tools:
         for dirpath, dirs, files in os.walk(str(base)):
             dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith("."))
             for f in sorted(files):
-                yield Path(dirpath) / f
+                if not self.is_protected(Path(dirpath) / f):
+                    yield Path(dirpath) / f
 
     # -- tools
     def list_files(self, path=".", recursive=False):
@@ -180,7 +190,7 @@ class Tools:
                     break
         else:
             for e in sorted(base.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
-                if e.name in SKIP_DIRS:
+                if e.name in SKIP_DIRS or self.is_protected(e):
                     continue
                 out.append(e.name + "/" if e.is_dir() else "%s (%s)" % (e.name, _size(e)))
                 if len(out) >= 200:
@@ -265,6 +275,7 @@ class Tools:
         if not self.confirm("edit " + self.rel(full), make_diff(text, result, self.rel(full))):
             return "Declined by user."
         self.save(full, result, crlf, bom)
+        self.changed.add(self.rel(full))
         return "OK: edited %s" % self.rel(full)
 
     def write_file(self, path, content, append=False):
@@ -287,6 +298,7 @@ class Tools:
         if not self.confirm(title, preview):
             return "Declined by user."
         self.save(full, new, crlf, bom)
+        self.changed.add(self.rel(full))
         return "OK: %s now has %d lines" % (self.rel(full), len(new.splitlines()))
 
 
@@ -529,7 +541,7 @@ class Footer:
 
 
 FOOTER = Footer()
-INLINE_LABELS = ("waiting for model", "summarizing old messages")
+INLINE_LABELS = ("waiting for model", "summarizing old messages", "checking changes")
 
 
 class Ticker:
@@ -628,6 +640,53 @@ class Ticker:
         t = self.elapsed()
         self.t0 = None
         return t
+
+
+# --------------------------------------------------------- error feedback
+def syntax_error(name, text):
+    """Parse (never run) a file of a known type -> description of the first error, or None."""
+    ext = Path(name).suffix.lower()
+    try:
+        if ext == ".py":
+            compile(text, name, "exec")
+        elif ext == ".json":
+            json.loads(text)
+        elif ext in (".ini", ".cfg"):
+            configparser.ConfigParser(interpolation=None).read_string(text)
+        elif ext == ".toml":
+            import tomllib              # Python >= 3.11 only
+            tomllib.loads(text)
+        elif ext == ".xml":
+            ET.fromstring(text)
+    except SyntaxError as e:
+        line = (e.text or "").strip()
+        return "line %s: %s%s" % (e.lineno, e.msg, (" -> " + line[:100]) if line else "")
+    except json.JSONDecodeError as e:
+        return "line %d, column %d: %s" % (e.lineno, e.colno, e.msg)
+    except ET.ParseError as e:
+        return "line %d, column %d: %s" % (e.position + (str(e),))
+    except configparser.Error as e:
+        return str(e).replace("\n", " ")[:200]
+    except ImportError:
+        return None
+    except ValueError as e:             # tomllib.TOMLDecodeError, compile() on NUL bytes, ...
+        return str(e)[:200]
+    return None
+
+
+def run_check(command, cwd, timeout, cap):
+    """Run the user's check command in the project folder -> (ok, output tail)."""
+    try:
+        p = subprocess.run(command, shell=True, cwd=str(cwd), stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, errors="replace", timeout=timeout, **_quiet())
+    except subprocess.TimeoutExpired:
+        return False, "the check did not finish within %d s" % timeout
+    except OSError as e:
+        return False, "could not run the check: %s" % (e.strerror or e)
+    out = (p.stdout + p.stderr).strip()
+    if len(out) > cap:                  # errors and the summary come last
+        out = "...[cut]\n" + out[-cap:]
+    return p.returncode == 0, out or "(no output, exit code %d)" % p.returncode
 
 
 # ------------------------------------------------------------------- agent
@@ -940,8 +999,41 @@ class Agent:
             out = out[:cap] + "\n...[output cut, %d chars]" % (len(out) - cap)
         return out
 
+    MAX_ERROR_STREAK = 5
+
+    def verify(self):
+        """Check the files changed in this turn (syntax, optional command) -> report for the model,
+        '' when everything is fine or nothing was changed."""
+        changed = sorted(self.tools.changed)
+        if not changed or not (self.a.syntax_check or self.a.check):
+            return ""
+        self.ticker.phase("checking changes")
+        try:
+            parts, bad = [], []
+            if self.a.syntax_check:
+                for rel in changed:
+                    try:
+                        err = syntax_error(rel, self.tools.load(self.tools.root / rel)[0])
+                    except (ToolError, OSError):
+                        continue
+                    if err:
+                        bad.append("- %s: %s" % (rel, err))
+            if bad:
+                parts.append("Syntax errors:\n" + "\n".join(bad))
+            if self.a.check:
+                ok, out = run_check(self.a.check, self.tools.root, self.a.check_timeout, self.tool_cap())
+                if not ok:
+                    parts.append("The check command `%s` failed:\n%s" % (self.a.check, out))
+        finally:
+            self.ticker.phase("")
+        if not parts:
+            say(dim("[check ok: %s]" % ", ".join(changed[:5]) + (" ..." if len(changed) > 5 else "")))
+        return "\n\n".join(parts)
+
     def run_turn(self, text):
         self.perf = {"prompt_s": 0.0, "gen_s": 0.0, "tokens": 0}
+        self.tools.changed.clear()
+        rounds, streak, last_fail = 0, 0, None
         self.msgs.append({"role": "user", "content": text})
         try:
             for _ in range(self.a.max_steps):
@@ -956,16 +1048,45 @@ class Agent:
                 if not calls:
                     if res["finish"] == "length":
                         say(paint("33", "[reply cut off: max-tokens reached]"))
-                    return
+                    report = self.verify()
+                    if not report:
+                        return
+                    say(paint("33", "[check] problems found:"))
+                    say(dim("\n".join(report.split("\n")[:12])))
+                    if rounds >= self.a.check_rounds:
+                        say(paint("33", "[giving up after %d fix attempts - the problems above remain]" % rounds))
+                        return
+                    rounds += 1
+                    say(paint("33", "[check] sending them back to the model (attempt %d/%d)" %
+                              (rounds, self.a.check_rounds)))
+                    self.msgs.append({"role": "user", "_cont": True, "content":
+                                      "[automatic check after your changes, attempt %d/%d]\n%s\n\n"
+                                      "Fix these problems, then answer briefly." %
+                                      (rounds, self.a.check_rounds, report)})
+                    continue
                 for c in calls:
                     say(dim("→ " + _fmt_call(c)))
                     out = self.execute(c)
-                    say(dim("  " + out.split("\n")[0][:100] + (" ..." if "\n" in out else "")))
+                    sig = (c["name"], c["raw"] if self.native else json.dumps(c["args"], sort_keys=True))
+                    if out.startswith("ERROR"):
+                        streak += 1
+                        if sig == last_fail:
+                            out += ("\n[This exact call already failed. Don't repeat it: change the arguments "
+                                    "or the approach, or ask the user.]")
+                        last_fail = sig
+                    else:
+                        streak, last_fail = 0, None
+                    first = "  " + out.split("\n")[0][:100] + (" ..." if "\n" in out else "")
+                    say(paint("31", first) if out.startswith("ERROR") else dim(first))
                     if self.native:
                         self.msgs.append({"role": "tool", "tool_call_id": c["id"], "content": out})
                     else:
                         self.msgs.append({"role": "user", "_cont": True,
                                           "content": "TOOL RESULT %s:\n%s" % (c["name"], out)})
+                if streak >= self.MAX_ERROR_STREAK:
+                    say(paint("33", "[stopped: %d tool errors in a row - rephrase the task or help the model "
+                                    "with @file]" % streak))
+                    return
             say(paint("33", "[step limit reached; continue with a new message]"))
         except KeyboardInterrupt:
             say(paint("33", "\n[interrupted]"))
@@ -1009,7 +1130,8 @@ def _fmt_call(c):
 # ------------------------------------------------- config file + server
 CONFIG_NAME = "miniharness.ini"
 HARNESS_KEYS = {"dir", "url", "model", "api_key", "ctx", "max_tokens", "protocol",
-                "temperature", "max_steps", "summarize", "auto_approve", "footer", "banner"}
+                "temperature", "max_steps", "summarize", "auto_approve", "footer", "banner",
+                "syntax_check", "check", "check_rounds", "check_timeout"}
 SERVER_KEYS = {"start", "type", "command", "model", "hf_repo", "host", "port", "args",
                "timeout", "log", "gpu_layers", "threads", "tool_parser"}
 
@@ -1038,6 +1160,15 @@ max_steps = 20
 summarize = true
 # Apply file changes without asking.
 auto_approve = false
+# Self-correction: after the model changed files they are checked and any errors are sent back to it.
+# syntax_check parses .py .json .ini .cfg .toml .xml files (nothing is executed).
+syntax_check = true
+# Optional command run in the project folder after changes, e.g. python -m pytest -q (runs through the shell).
+# If it fails, its output goes back to the model. Empty = off.
+check =
+# How many times the model may try to fix reported problems per message, and the command's time limit (s).
+check_rounds = 3
+check_timeout = 60
 # Clear the screen and show the ASCII-art logo at start.
 banner = true
 # Status bar on the last terminal line with live time, speed, context and CPU/GPU load.
@@ -1787,6 +1918,13 @@ def parse_args(argv=None):
                     help="drop old messages without summarizing them")
     ap.add_argument("-y", "--yes", action="store_true", default=d(None, "auto_approve", False, _bool),
                     help="apply file changes without asking")
+    ap.add_argument("--check", default=d(None, "check", ""), metavar="CMD",
+                    help="command to run after file changes (e.g. 'python -m pytest -q'); failures go back to the model")
+    ap.add_argument("--check-rounds", type=int, default=d(None, "check_rounds", 3, int),
+                    help="max fix attempts per message after failed checks (default 3)")
+    ap.add_argument("--check-timeout", type=int, default=d(None, "check_timeout", 60, int))
+    ap.add_argument("--no-syntax-check", dest="syntax_check", action="store_false",
+                    default=d(None, "syntax_check", True, _bool), help="don't parse changed .py/.json/... files")
     ap.add_argument("--no-banner", dest="banner", action="store_false", default=d(None, "banner", True, _bool),
                     help="don't clear the screen / show the logo at start")
     ap.add_argument("--no-footer", dest="footer", action="store_false", default=d(None, "footer", True, _bool),
@@ -1892,6 +2030,8 @@ def _run(args, client, root):
     agent = Agent(args, client, None, n_ctx)
     agent.ticker = ticker
     agent.tools = Tools(root, confirm, agent.tool_cap)
+    agent.tools.protected = {Path(p).resolve() for p in (
+        args.conf.path, args.conf.s.get("log") or args.conf.base / "miniharness-server.log") if p}
     say(paint("1", "miniharness") + dim(" · %s · model %s · folder %s · context %d tokens (%s) · reply reserve %d" %
                                         (args.url, client.model, agent.tools.root, n_ctx, src, agent.reserve)))
     agent.ctx_guess = not args.ctx and not detected
