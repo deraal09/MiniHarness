@@ -98,6 +98,20 @@ args = --n-gpu-layers 99
 - Serverausgabe steht in `miniharness-server.log`; startet der Server nicht, werden die letzten Zeilen gezeigt.
 - `--no-server` ignoriert den `[server]`-Abschnitt. Für Zugriff aus dem Netz `host = 0.0.0.0` setzen.
 
+## Thinking ausblenden
+
+Denkmodelle (Qwen3, DeepSeek-R1, gpt-oss, …) geben ihre Überlegungen vor der Antwort aus. Mit `--hide-thinking`
+(Config: `hide_thinking = true`, im Programm: `/think` zum Umschalten) werden sie nicht ausgegeben. Stattdessen läuft in der
+Statusleiste live `thinking` und danach steht eine Zeile `[thought for 8.2s, ~400 tokens]`; erst dann kommt die Antwort.
+
+- Erkannt wird das Denken in beiden Formen: als eigenes Feld des Servers (`reasoning_content`/`reasoning`, llama.cpp,
+  vLLM, Ollama) und inline als `<think> … </think>` im Text (auch wenn das Tag über zwei Stücke des Streams verteilt ist).
+- **Unabhängig von der Anzeige** wird das Denken nie in den Gesprächsverlauf übernommen – das spart Kontext. Ohne
+  `--hide-thinking` wird es nur gedimmt angezeigt.
+- Grenze: Öffnet schon das Chat-Template das `<think>` (Modell schreibt nur `… </think>`), kann das Harness den Text davor
+  nicht mehr zurückholen, wenn er schon gestreamt wurde; aus dem Verlauf wird er aber entfernt. Besser: llama.cpp mit
+  `--reasoning-format deepseek` (bzw. der Standardeinstellung) starten, dann kommt das Denken im eigenen Feld.
+
 ## Fehler-Rückkopplung (Selbstkorrektur)
 
 Das Harness meldet dem Modell Fehler zurück, damit es sie selbst behebt:

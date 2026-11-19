@@ -57,10 +57,12 @@ class FakeLLM(BaseHTTPRequestHandler):
                                     "This model's maximum context length is 3000 tokens. However, you "
                                     "requested 9000 tokens in the messages."}, 400)
         step = FakeLLM.script.pop(0) if FakeLLM.script else {"content": "ok"}
+        think = [{"choices": [{"delta": {"reasoning_content": step["think"]}, "finish_reason": None}]}] \
+            if "think" in step else []
         delta = {"content": step["content"]} if "content" in step else {"tool_calls": [{
             **({} if self.ollama else {"index": 0}), "id": "c1", "function": {
                 "name": step["tool"][0], "arguments": json.dumps(step["tool"][1])}}]}
-        chunks = [{"choices": [{"delta": delta, "finish_reason": None}]},
+        chunks = think + [{"choices": [{"delta": delta, "finish_reason": None}]},
                   {"choices": [{"delta": {}, "finish_reason": "stop"}]},
                   {"choices": [], "usage": {"prompt_tokens": 100, "completion_tokens": 10}}]
         time.sleep(self.delay)
@@ -162,6 +164,41 @@ class AgentTests(Base):
         calls = mh.parse_text_calls('ok\nTOOL: {"name": "read_file", "arguments": {"path": "a"}}')
         self.assertEqual(calls[0]["name"], "read_file")
         self.assertIn("error", mh.parse_text_calls('TOOL: {"name": "x", "argu')[0])
+
+
+class ThinkingTests(unittest.TestCase):
+    def run_filter(self, pieces):
+        f = mh.ThinkFilter()
+        out = []
+        for p in pieces:
+            out += f.feed(p)
+        out += f.flush()
+        merged = []
+        for kind, text in out:                     # merge neighbours of the same kind
+            if merged and merged[-1][0] == kind:
+                merged[-1] = (kind, merged[-1][1] + text)
+            else:
+                merged.append((kind, text))
+        return f, merged
+
+    def test_tags_split_across_chunks(self):
+        f, out = self.run_filter(["<thi", "nk>plan a", " b</th", "ink>\n\nAnsw", "er"])
+        self.assertEqual(out, [("think", "plan a b"), ("text", "\n\nAnswer")])
+        self.assertEqual(f.text("RAW"), "Answer")
+
+    def test_no_tags_leaves_text_untouched(self):
+        f, out = self.run_filter(["a < b ", "and <i>x</i> ", "<"])
+        self.assertEqual(out, [("text", "a < b and <i>x</i> <")])
+        self.assertEqual(f.text("  raw  "), "  raw  ")
+
+    def test_orphan_close_tag_drops_earlier_text_from_history(self):
+        f, out = self.run_filter(["reasoning first</think>The answer"])
+        self.assertEqual(f.text("RAW"), "The answer")
+
+    def test_unclosed_think_is_all_thinking(self):
+        f, out = self.run_filter(["<think>never ends"])
+        self.assertEqual(out, [("think", "never ends")])
+        self.assertEqual(f.text("RAW"), "")
 
 
 class FeedbackTests(Base):
@@ -333,6 +370,41 @@ class EndToEnd(Base):
         results = [m["content"] for m in a.msgs if m["role"] == "tool"]
         self.assertNotIn("already failed", results[0])
         self.assertIn("already failed", results[1])
+
+    def run_capture(self, agent, text):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            agent.run_turn(text)
+        return buf.getvalue()
+
+    def test_thinking_shown_by_default_and_hidden_on_request(self):
+        FakeLLM.script = [{"think": "secret plan", "content": "Answer one"}]
+        a = self.make_agent()
+        out = self.run_capture(a, "q1")
+        self.assertIn("secret plan", out)
+        self.assertIn("Answer one", out)
+        FakeLLM.script = [{"think": "secret plan", "content": "Answer two"}]
+        a = self.make_agent("--hide-thinking")
+        out = self.run_capture(a, "q2")
+        self.assertNotIn("secret plan", out)
+        self.assertIn("Answer two", out)
+        self.assertIn("[thought for", out)
+        self.assertEqual(a.msgs[-1]["content"], "Answer two")          # reasoning_content is never kept
+
+    def test_inline_think_tags_are_hidden_and_not_kept_in_history(self):
+        FakeLLM.script = [{"content": "<think>hidden musings</think>\n\nVisible answer"}]
+        a = self.make_agent("--hide-thinking")
+        out = self.run_capture(a, "q")
+        self.assertNotIn("hidden musings", out)
+        self.assertIn("Visible answer", out)
+        self.assertEqual(a.msgs[-1]["content"], "Visible answer")
+        FakeLLM.script = [{"content": "<think>shown musings</think>\n\nVisible again"}]
+        out = self.run_capture(self.make_agent(), "q")
+        self.assertIn("shown musings", out)                             # not hidden: still printed ...
+        a2 = self.make_agent()
+        FakeLLM.script = [{"content": "<think>x</think>Y"}]
+        a2.run_turn("q")
+        self.assertEqual(a2.msgs[-1]["content"], "Y")                   # ... but never stored
 
     def test_measure_base(self):
         a = mh.Agent(mh.parse_args(["--dir", str(self.root)]), mh.Client(self.url), self.tools, 2048)

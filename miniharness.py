@@ -541,7 +541,7 @@ class Footer:
 
 
 FOOTER = Footer()
-INLINE_LABELS = ("waiting for model", "summarizing old messages", "checking changes")
+INLINE_LABELS = ("waiting for model", "summarizing old messages", "checking changes", "thinking")
 
 
 class Ticker:
@@ -748,6 +748,57 @@ def parse_text_calls(text):
             calls.append({"id": "", "name": obj["name"], "args": a if isinstance(a, dict) else {}})
 
 
+class ThinkFilter:
+    """Splits a streamed reply into ("think", text) and ("text", text) pieces at <think> ... </think>,
+    even when a tag is cut in two by the chunking. Collects the visible text in .visible.
+    A </think> without an opening tag (the chat template already opened it) turns everything
+    before it into thinking for the stored history; what was already streamed stays on screen."""
+
+    OPEN, CLOSE = "<think>", "</think>"
+
+    def __init__(self):
+        self.buf, self.inside, self.visible, self.seen = "", False, [], False
+
+    def feed(self, piece):
+        self.buf += piece
+        out = []
+        while True:
+            tags = (self.CLOSE,) if self.inside else (self.OPEN, self.CLOSE)
+            hits = [(self.buf.find(t), t) for t in tags if t in self.buf]
+            if not hits:
+                break
+            i, tag = min(hits)
+            kind = "think" if self.inside else "text"
+            if tag == self.CLOSE and not self.inside:       # orphan close tag
+                kind, self.visible = "think", []
+            if i:
+                out.append((kind, self.buf[:i]))
+            self.buf = self.buf[i + len(tag):]
+            self.inside = tag == self.OPEN
+            self.seen = True
+        # keep a possible beginning of a tag for the next chunk
+        keep = max((n for t in tags for n in range(1, len(t)) if self.buf.endswith(t[:n])), default=0)
+        emit, self.buf = self.buf[:len(self.buf) - keep], self.buf[len(self.buf) - keep:]
+        if emit:
+            out.append(("think" if self.inside else "text", emit))
+        for kind, text in out:
+            if kind == "text":
+                self.visible.append(text)
+        return out
+
+    def flush(self):
+        rest, self.buf = self.buf, ""
+        if not rest:
+            return []
+        if not self.inside:
+            self.visible.append(rest)
+        return [("think" if self.inside else "text", rest)]
+
+    def text(self, raw):
+        """Reply text without thinking; unchanged when the model used no tags."""
+        return "".join(self.visible).strip() if self.seen else raw
+
+
 class Agent:
     def __init__(self, args, client, tools, n_ctx):
         self.a, self.client, self.tools = args, client, tools
@@ -924,24 +975,53 @@ class Agent:
             started = [False]
             t = {"start": time.time(), "first": None}
             self.ticker.call_started()
+            filt = ThinkFilter()
+            th = {"t0": None, "n": 0, "open": False}     # a thinking phase: start time, pieces, text on screen
 
             def on_chunk():
                 if t["first"] is None:
                     t["first"] = time.time()
                 self.ticker.chunk()
 
-            def on_text(piece):
+            def on_think(piece):
+                if th["t0"] is None:
+                    th["t0"] = time.time()
+                th["n"] += 1
+                if self.a.hide_thinking:
+                    self.ticker.phase("thinking")
+                else:
+                    self.ticker.phase("generating")
+                    started[0] = th["open"] = True
+                    say(dim(piece), end="")
+
+            def end_think():
+                if th["t0"] is None:
+                    return
+                if self.a.hide_thinking:
+                    say(dim("[thought for %s, ~%d tokens]" % (fmt_secs(time.time() - th["t0"]), th["n"])))
+                elif th["open"]:
+                    say()
+                th["t0"], th["n"], th["open"] = None, 0, False
+
+            def show_text(piece):
+                end_think()
                 self.ticker.phase("generating")
                 started[0] = True
                 say(piece, end="")
 
-            def on_think(piece):
-                self.ticker.phase("generating")
-                say(dim(piece), end="")
+            def route(parts):
+                for kind, piece in parts:
+                    (on_think if kind == "think" else show_text)(piece)
+
+            def on_text(piece):
+                route(filt.feed(piece))
 
             try:
                 res = self.client.chat(payload, TOOL_SPECS if self.native else None, self.reserve,
                                        self.a.temperature, on_text, on_think, on_chunk)
+                route(filt.flush())
+                end_think()
+                res["content"] = filt.text(res["content"])      # thinking never goes into the history
             except LLMError as e:
                 if e.is_context and attempt < 2:
                     limit = re.search(r"maximum context length is (\d+)", str(e))     # vLLM names the limit
@@ -1131,7 +1211,7 @@ def _fmt_call(c):
 CONFIG_NAME = "miniharness.ini"
 HARNESS_KEYS = {"dir", "url", "model", "api_key", "ctx", "max_tokens", "protocol",
                 "temperature", "max_steps", "summarize", "auto_approve", "footer", "banner",
-                "syntax_check", "check", "check_rounds", "check_timeout"}
+                "syntax_check", "check", "check_rounds", "check_timeout", "hide_thinking"}
 SERVER_KEYS = {"start", "type", "command", "model", "hf_repo", "host", "port", "args",
                "timeout", "log", "gpu_layers", "threads", "tool_parser"}
 
@@ -1160,6 +1240,8 @@ max_steps = 20
 summarize = true
 # Apply file changes without asking.
 auto_approve = false
+# Don't print the model's thinking (reasoning); show only "[thought for 8.2s, ~400 tokens]". /think toggles it.
+hide_thinking = false
 # Self-correction: after the model changed files they are checked and any errors are sent back to it.
 # syntax_check parses .py .json .ini .cfg .toml .xml files (nothing is executed).
 syntax_check = true
@@ -1856,6 +1938,7 @@ HELP = """\
 /compact    summarize the conversation to free context
 /clear      forget the conversation
 /auto       toggle auto-approve of file changes
+/think      hide / show the model's thinking
 /hw         show CPU / GPU information and current load  (live values are in the status bar)
 /files [x]  list the files in the folder, pick some to attach to your next message
 @name       in a message: attach that file (@ alone or @part opens a picker, Tab completes)
@@ -1918,6 +2001,8 @@ def parse_args(argv=None):
                     help="drop old messages without summarizing them")
     ap.add_argument("-y", "--yes", action="store_true", default=d(None, "auto_approve", False, _bool),
                     help="apply file changes without asking")
+    ap.add_argument("--hide-thinking", action="store_true", default=d(None, "hide_thinking", False, _bool),
+                    help="don't print the model's thinking, just how long it thought")
     ap.add_argument("--check", default=d(None, "check", ""), metavar="CMD",
                     help="command to run after file changes (e.g. 'python -m pytest -q'); failures go back to the model")
     ap.add_argument("--check-rounds", type=int, default=d(None, "check_rounds", 3, int),
@@ -2128,6 +2213,9 @@ def _run(args, client, root):
             elif cmd == "/auto":
                 state["auto"] = not state["auto"]
                 say("auto-approve " + ("on" if state["auto"] else "off"))
+            elif cmd in ("/think", "/hidethinking"):
+                args.hide_thinking = not args.hide_thinking
+                say("thinking is now " + ("hidden" if args.hide_thinking else "shown"))
             elif cmd == "/files":
                 cache["t"] = 0.0
                 try:
