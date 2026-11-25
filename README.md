@@ -98,6 +98,43 @@ args = --n-gpu-layers 99
 - Serverausgabe steht in `miniharness-server.log`; startet der Server nicht, werden die letzten Zeilen gezeigt.
 - `--no-server` ignoriert den `[server]`-Abschnitt. Für Zugriff aus dem Netz `host = 0.0.0.0` setzen.
 
+## Scripts: Aufgaben ohne KI erledigen
+
+Für mechanische Massenarbeit (viele Dateien umbenennen, konvertieren, zählen, sortieren, wiederkehrende Textersetzungen)
+muss das Modell nicht jede Datei einzeln durchdenken: Es schreibt ein Script, führt es aus und wirft es wieder weg.
+
+```
+→ run_script(name="rename", code="import pathlib ...")
+run script 'rename' (python, temporary, timeout 60s, in /home/me/projekt)
+  <vollständiger Code>
+run this script? [y/N/a=always this session] y
+  OK: script finished (exit 0, 0.4s) ... Files changed by the script: doc_f1.txt (modified) ...
+  The temporary script was deleted.
+```
+
+- **Sprachen:** `python` (läuft mit dem Python, das auch das Harness nutzt – daher unter Linux und Windows gleich) und `shell`
+  (bash/sh bzw. PowerShell unter Windows).
+- **Temporär ist der Normalfall:** Das Script liegt in einem temporären Ordner und wird nach dem Lauf **immer** gelöscht
+  (auch bei Fehler, Timeout oder Strg+C).
+- **Wiederkehrende Aufgaben entscheidet das Modell selbst:** Hält es eine Aufgabe für wiederkehrend, setzt es `keep=true`
+  mit Namen und Beschreibung; dann wird das Script in `scripts/` im Projektordner gespeichert (Kopfzeile mit
+  Beschreibung). Beim nächsten Mal sieht es mit `list_scripts` die gespeicherten Scripts und startet eines mit
+  `run_script name=…` (ohne neuen Code). Überholte Scripts kann es mit `delete=true` löschen. Sie selbst sehen die Liste mit
+  `/scripts` und löschen mit `/scripts rm NAME` – oder einfach die Datei in `scripts/` entfernen.
+- **Sie bleiben in der Kontrolle:** `scripts = ask` (Standard): vor **jedem** Lauf sehen Sie den vollständigen Code und
+  bestätigen (`a` = für diese Sitzung immer). `scripts = auto` führt ohne Rückfrage aus (der Code wird trotzdem angezeigt),
+  `scripts = off` schaltet das Feature ab – dann entfallen auch die Tool-Definitionen (ca. 300 Tokens Kontext gespart).
+  `auto_approve`/`-y` gilt **nicht** für Scripts.
+- **Nach dem Lauf:** Das Harness meldet dem Modell und Ihnen, welche Dateien neu, geändert oder gelöscht wurden, und
+  schickt neue/geänderte Dateien durch die Syntaxprüfung bzw. den `check`-Befehl (siehe Fehler-Rückkopplung). Fehlercode,
+  Traceback und Zeitüberschreitung (`script_timeout`, Standard 60 s) gehen als Fehler zurück, sodass das Modell nachbessern kann.
+- **Schutzmaßnahmen:** Arbeitsverzeichnis ist der Projektordner; die Umgebung wird von Variablen mit `KEY`, `TOKEN`, `SECRET`,
+  `PASSWORD`, `AUTH` bereinigt; stdin ist geschlossen; Python läuft mit `-I` (ignoriert `PYTHONPATH` und Nutzerpakete);
+  `miniharness.ini` wird nach dem Lauf bei Änderung automatisch wiederhergestellt.
+- **Wichtig – das ist keine Sandbox:** Ein Script kann alles, was Ihr Benutzerkonto kann (andere Ordner lesen/löschen,
+  Netzwerk nutzen). Die Rückfrage mit dem vollständigen Code ist die Sicherung – lesen Sie ihn, besonders wenn das Modell
+  Dateien aus fremden Quellen (Webseiten, heruntergeladene Texte) gelesen hat, die Anweisungen enthalten könnten.
+
 ## Thinking ausblenden
 
 Denkmodelle (Qwen3, DeepSeek-R1, gpt-oss, …) geben ihre Überlegungen vor der Antwort aus. Mit `--hide-thinking`

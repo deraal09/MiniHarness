@@ -20,6 +20,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -99,6 +100,17 @@ TOOL_SPECS = [
 ]
 
 
+SCRIPT_SPECS = [
+    _spec("run_script", "Run a script for mechanical bulk work (no AI needed). Deleted after the run unless "
+          "keep=true (recurring tasks only; needs name+description). No code = run saved script 'name'; "
+          "delete=true removes it.",
+          {"code": ("string", ""), "language": ("string", "python|shell"), "args": ("string", ""),
+           "name": ("string", ""), "keep": ("boolean", ""), "description": ("string", ""),
+           "delete": ("boolean", "")}),
+    _spec("list_scripts", "List the saved scripts (name: description).", {}),
+]
+
+
 def make_diff(old, new, name, limit=40):
     lines = list(difflib.unified_diff(old.splitlines(), new.splitlines(),
                                       "a/" + name, "b/" + name, lineterm="", n=2))
@@ -123,8 +135,9 @@ class Tools:
         self.cap = cap              # cap() -> max chars of one tool result
         self.protected = set()      # resolved paths the model may neither read nor change (config, log)
         self.changed = set()        # relative paths written during the current turn
+        self.scripts = None         # ScriptRunner when scripts are enabled
         self.table = {s["function"]["name"]: getattr(self, s["function"]["name"])
-                      for s in TOOL_SPECS}
+                      for s in TOOL_SPECS + SCRIPT_SPECS}
 
     # -- helpers
     def is_protected(self, full):
@@ -178,6 +191,16 @@ class Tools:
                     yield Path(dirpath) / f
 
     # -- tools
+    def run_script(self, **kw):
+        if self.scripts is None:
+            raise ToolError("scripts are disabled")
+        return self.scripts.run(**kw)
+
+    def list_scripts(self):
+        if self.scripts is None:
+            raise ToolError("scripts are disabled")
+        return self.scripts.listing()
+
     def list_files(self, path=".", recursive=False):
         base = self.resolve(path)
         if not base.is_dir():
@@ -541,7 +564,8 @@ class Footer:
 
 
 FOOTER = Footer()
-INLINE_LABELS = ("waiting for model", "summarizing old messages", "checking changes", "thinking")
+INLINE_LABELS = ("waiting for model", "summarizing old messages", "checking changes", "thinking",
+                 "running script")
 
 
 class Ticker:
@@ -640,6 +664,216 @@ class Ticker:
         t = self.elapsed()
         self.t0 = None
         return t
+
+
+# ------------------------------------------------------------------ scripts
+SECRET_ENV = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)", re.I)
+LANGS = {"python": ".py", "shell": ".ps1" if os.name == "nt" else ".sh"}
+LANG_ALIASES = {"py": "python", "python3": "python", "sh": "shell", "bash": "shell", "powershell": "shell",
+                "ps1": "shell", "pwsh": "shell"}
+HEADER = "# miniharness script: "
+
+
+def clean_env(root):
+    """Environment for scripts: no API keys/tokens/passwords from the parent, UTF-8 everywhere."""
+    env = {k: v for k, v in os.environ.items() if not SECRET_ENV.search(k)}
+    env.update({"PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1", "MINIHARNESS_PROJECT": str(root)})
+    return env
+
+
+def script_argv(lang, path):
+    if lang == "python":
+        return [sys.executable, "-I", "-B", "-X", "utf8", str(path)]     # -I: ignore PYTHONPATH/user site/cwd
+    if os.name == "nt":
+        return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(path)]
+    return [shutil.which("bash") or "sh", str(path)]
+
+
+def kill_tree(p):
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+        else:
+            os.killpg(p.pid, signal.SIGKILL)
+    except OSError:
+        p.kill()
+
+
+class ScriptRunner:
+    """Lets the model write a script, run it (after the user approved the code) and throw it away again.
+    Scripts the model marks as recurring are kept in <project>/<dirname>/ and can be run by name."""
+
+    def __init__(self, tools, timeout=60, dirname="scripts", confirm=None, phase=None):
+        self.tools, self.timeout, self.dirname = tools, timeout, dirname
+        self.confirm = confirm or (lambda title, preview: False)    # confirm(title, code) -> bool
+        self.phase = phase or (lambda label: None)
+        self.last_path = None
+
+    @property
+    def kept_dir(self):
+        return self.tools.root / self.dirname
+
+    @staticmethod
+    def lang_of(name):
+        lang = LANG_ALIASES.get(str(name or "python").strip().lower(), str(name or "python").strip().lower())
+        if lang not in LANGS:
+            raise ToolError("language must be python or shell")
+        return lang
+
+    def kept(self):
+        """{name: (path, language, description)} of the saved scripts."""
+        out = {}
+        for ext, lang in ((".py", "python"), (".sh", "shell"), (".ps1", "shell")):
+            for f in sorted(self.kept_dir.glob("*" + ext)) if self.kept_dir.is_dir() else []:
+                desc = ""
+                try:
+                    first = f.read_text(encoding="utf-8", errors="replace").split("\n", 1)[0]
+                    desc = first[len(HEADER):].strip() if first.startswith(HEADER) else ""
+                except OSError:
+                    pass
+                out[f.stem] = (f, lang, desc)
+        return out
+
+    def listing(self):
+        k = self.kept()
+        return "\n".join("%s (%s): %s" % (n, lang, d or "no description") for n, (_, lang, d) in k.items()) \
+            or "[no saved scripts]"
+
+    def snapshot(self):
+        snap = {}
+        for f in self.tools.walk(self.tools.root):
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            snap[self.tools.rel(f)] = (st.st_mtime_ns, st.st_size)
+            if len(snap) >= 5000:
+                break
+        return snap
+
+    def run(self, code="", language="python", args="", name="", keep=False, description="", delete=False):
+        name = str(name or "").strip()
+        if name and not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", name):
+            raise ToolError("name may only contain letters, digits, - and _ (max 40)")
+        kept = self.kept()
+        if delete:
+            if name not in kept:
+                raise ToolError("no saved script '%s'" % name)
+            path = kept[name][0]
+            if not self.tools.confirm("delete saved script " + self.tools.rel(path), "(the file is removed)"):
+                return "Declined by user."
+            path.unlink()
+            return "OK: deleted saved script %s" % name
+        code = str(code or "")
+        if not code.strip():                                    # run a saved script
+            if name not in kept:
+                raise ToolError("give code, or the name of a saved script (list_scripts)" if not name
+                                else "no saved script '%s' (list_scripts)" % name)
+            path, lang, _ = kept[name]
+            code, state = path.read_text(encoding="utf-8", errors="replace"), "saved script"
+            keep = False
+        else:
+            lang = self.lang_of(language)
+            if keep and not (name and str(description or "").strip()):
+                raise ToolError("keep=true needs a name and a description of what the script is for")
+            state = "will be saved as %s/%s%s" % (self.dirname, name, LANGS[lang]) if keep else "temporary"
+            path = None
+        argv_extra = split_cmd(str(args or "")) if args else []
+        label = name or "task"
+        self.phase("")
+        title = "run script '%s' (%s, %s, timeout %ds, in %s)" % (label, lang, state, self.timeout, self.tools.root)
+        if not self.confirm(title, code.rstrip("\n")):
+            return "Declined by user."
+        tmp = None
+        try:
+            if keep:                                            # save first (approved), then run from there
+                self.kept_dir.mkdir(parents=True, exist_ok=True)
+                path = self.kept_dir / (name + LANGS[lang])
+                body = HEADER + " ".join(str(description).split())[:200] + "\n" + code
+                path.write_text(body if body.endswith("\n") else body + "\n", encoding="utf-8")
+            elif path is None:
+                tmp = Path(tempfile.mkdtemp(prefix="miniharness-"))
+                path = tmp / (label + LANGS[lang])
+                path.write_text(code if code.endswith("\n") else code + "\n", encoding="utf-8")
+            self.last_path = path
+            return self.execute(lang, path, argv_extra, label, keep, state == "saved script")
+        finally:
+            if tmp:
+                shutil.rmtree(str(tmp), ignore_errors=True)
+
+    def execute(self, lang, path, extra, label, kept_now, was_saved):
+        tools = self.tools
+        guard = {p: p.read_bytes() for p in set(tools.protected) | {tools.root / CONFIG_NAME} if p.is_file()}
+        before = self.snapshot()
+        out_file = Path(tempfile.mkdtemp(prefix="miniharness-out-")) / "out.txt"
+        kw = {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)} if os.name == "nt" \
+            else {"start_new_session": True}
+        t0, timed_out = time.time(), False
+        self.phase("running script")
+        try:
+            with open(str(out_file), "wb") as fh:
+                try:
+                    p = subprocess.Popen(script_argv(lang, path) + extra, cwd=str(tools.root), stdin=subprocess.DEVNULL,
+                                         stdout=fh, stderr=subprocess.STDOUT, env=clean_env(tools.root), **kw)
+                except OSError as e:
+                    raise ToolError("cannot start the script interpreter: %s" % (e.strerror or e))
+                try:
+                    p.wait(timeout=self.timeout)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    kill_tree(p)
+                    p.wait()
+                except BaseException:                           # Ctrl+C: don't leave it running
+                    kill_tree(p)
+                    p.wait()
+                    raise
+            secs = time.time() - t0
+            output = self.read_output(out_file)
+        finally:
+            self.phase("")
+            shutil.rmtree(str(out_file.parent), ignore_errors=True)
+        notes = []
+        for p_, data in guard.items():                          # a script must not rewrite our own config
+            try:
+                if not p_.is_file() or p_.read_bytes() != data:
+                    p_.write_bytes(data)
+                    notes.append("WARNING: the script changed %s - restored it" % p_.name)
+            except OSError:
+                pass
+        after = self.snapshot()
+        changes = [(r, "new" if r not in before else "modified") for r in sorted(after) if before.get(r) != after[r]]
+        changes += [(r, "deleted") for r in sorted(before) if r not in after]
+        tools.changed.update(r for r, kind in changes if kind != "deleted")
+        if changes:
+            notes.append("Files changed by the script: " + ", ".join("%s (%s)" % c for c in changes[:20]) +
+                         (" ..." if len(changes) > 20 else ""))
+        if timed_out:
+            head = "ERROR: script timed out after %d s and was stopped" % self.timeout
+        elif p.returncode:
+            head = "ERROR: script exited with code %d (%.1fs)" % (p.returncode, secs)
+        else:
+            head = "OK: script finished (exit 0, %.1fs)" % secs
+        if kept_now:
+            notes.append("Saved as %s - run it again with run_script name=%s" % (tools.rel(path), label))
+        elif not was_saved:
+            notes.append("The temporary script was deleted.")
+        cap = tools.cap()
+        if len(output) > cap:
+            output = output[:cap * 6 // 10] + "\n...[%d chars cut]...\n" % (len(output) - cap) + output[-cap * 4 // 10:]
+        return "\n".join([head] + ([output.rstrip()] if output.strip() else ["(no output)"]) + notes)
+
+    @staticmethod
+    def read_output(f, limit=200000):
+        size = f.stat().st_size
+        with open(str(f), "rb") as fh:
+            if size <= 2 * limit:
+                data = fh.read()
+            else:
+                head = fh.read(limit)
+                fh.seek(size - limit)
+                data = head + b"\n...[output cut]...\n" + fh.read()
+        return data.decode("utf-8", "replace")
 
 
 # --------------------------------------------------------- error feedback
@@ -811,7 +1045,8 @@ class Agent:
         self.ctx_guess = False      # n_ctx is only a default guess -> ask the server after 1st reply
         self.ticker = Ticker(live=False)
         self.perf = {"prompt_s": 0.0, "gen_s": 0.0, "tokens": 0}   # per turn: prompt wait, generation
-        self.tool_json = json.dumps(TOOL_SPECS, separators=(",", ":")) if self.native else ""
+        self.specs = TOOL_SPECS + (SCRIPT_SPECS if getattr(args, "scripts", "off") != "off" else [])
+        self.tool_json = json.dumps(self.specs, separators=(",", ":")) if self.native else ""
 
     # -- sizes
     @property
@@ -833,10 +1068,14 @@ class Agent:
              "- Don't repeat file contents in your answer; reply briefly. "
              "Answer in the user's language.\n"
              "Paths are relative to the project folder." % self.n_ctx)
+        if len(self.specs) > len(TOOL_SPECS):
+            s += ("\n- Mechanical bulk work (rename/convert/count many files): use run_script (runs in the project "
+                  "folder). Scripts are deleted after the run; keep=true only for recurring tasks; "
+                  "check list_scripts first.")
         if not self.native:
             s += ("\n\nTo use a tool, write one line: TOOL: {\"name\": \"<tool>\", \"arguments\": {...}}\n"
                   "Then stop and wait for the result. Tools:\n")
-            for t in TOOL_SPECS:
+            for t in self.specs:
                 f = t["function"]
                 req = f["parameters"]["required"]
                 args = ", ".join(k + ("" if k in req else "?") for k in f["parameters"]["properties"])
@@ -932,7 +1171,7 @@ class Agent:
         pt = None
         try:
             res = self.client.chat([{"role": "system", "content": self.system()}] + probe,
-                                   TOOL_SPECS if self.native else None, 1, 0.0)
+                                   self.specs if self.native else None, 1, 0.0)
             pt = res["prompt_tokens"]
         except LLMError:
             pass
@@ -1017,7 +1256,7 @@ class Agent:
                 route(filt.feed(piece))
 
             try:
-                res = self.client.chat(payload, TOOL_SPECS if self.native else None, self.reserve,
+                res = self.client.chat(payload, self.specs if self.native else None, self.reserve,
                                        self.a.temperature, on_text, on_think, on_chunk)
                 route(filt.flush())
                 end_think()
@@ -1211,7 +1450,7 @@ def _fmt_call(c):
 CONFIG_NAME = "miniharness.ini"
 HARNESS_KEYS = {"dir", "url", "model", "api_key", "ctx", "max_tokens", "protocol",
                 "temperature", "max_steps", "summarize", "auto_approve", "footer", "banner",
-                "syntax_check", "check", "check_rounds", "check_timeout", "hide_thinking"}
+                "syntax_check", "check", "check_rounds", "check_timeout", "hide_thinking", "scripts", "script_timeout", "scripts_dir"}
 SERVER_KEYS = {"start", "type", "command", "model", "hf_repo", "host", "port", "args",
                "timeout", "log", "gpu_layers", "threads", "tool_parser"}
 
@@ -1242,6 +1481,12 @@ summarize = true
 auto_approve = false
 # Don't print the model's thinking (reasoning); show only "[thought for 8.2s, ~400 tokens]". /think toggles it.
 hide_thinking = false
+# Scripts: the model may write a script for mechanical work, run it and delete it again (kept in scripts_dir
+# if it marks the task as recurring). off = disabled (also saves context), ask = you approve every run after seeing
+# the code, auto = run without asking. Scripts are NOT sandboxed: they can do whatever your user account can do.
+scripts = ask
+script_timeout = 60
+scripts_dir = scripts
 # Self-correction: after the model changed files they are checked and any errors are sent back to it.
 # syntax_check parses .py .json .ini .cfg .toml .xml files (nothing is executed).
 syntax_check = true
@@ -1939,6 +2184,7 @@ HELP = """\
 /clear      forget the conversation
 /auto       toggle auto-approve of file changes
 /think      hide / show the model's thinking
+/scripts    list the scripts the model saved (/scripts rm NAME deletes one)
 /hw         show CPU / GPU information and current load  (live values are in the status bar)
 /files [x]  list the files in the folder, pick some to attach to your next message
 @name       in a message: attach that file (@ alone or @part opens a picker, Tab completes)
@@ -2001,6 +2247,9 @@ def parse_args(argv=None):
                     help="drop old messages without summarizing them")
     ap.add_argument("-y", "--yes", action="store_true", default=d(None, "auto_approve", False, _bool),
                     help="apply file changes without asking")
+    ap.add_argument("--scripts", choices=["off", "ask", "auto"], default=d(None, "scripts", "ask"),
+                    help="model-written scripts: off, ask (approve each run, default) or auto (run without asking)")
+    ap.add_argument("--script-timeout", type=int, default=d(None, "script_timeout", 60, int))
     ap.add_argument("--hide-thinking", action="store_true", default=d(None, "hide_thinking", False, _bool),
                     help="don't print the model's thinking, just how long it thought")
     ap.add_argument("--check", default=d(None, "check", ""), metavar="CMD",
@@ -2016,6 +2265,7 @@ def parse_args(argv=None):
                     help="no pinned status bar (just a live line while waiting)")
     ap.add_argument("-p", "--prompt", help="run a single prompt and exit")
     args = ap.parse_args(argv)
+    args.scripts_dir = conf.h.get("scripts_dir", "scripts")
     args.conf = conf
     return args
 
@@ -2115,6 +2365,28 @@ def _run(args, client, root):
     agent = Agent(args, client, None, n_ctx)
     agent.ticker = ticker
     agent.tools = Tools(root, confirm, agent.tool_cap)
+    script_state = {"all": args.scripts == "auto"}
+
+    def confirm_script(title, code):
+        ticker.pause()                  # waiting for the user doesn't count
+        try:
+            say(paint("36", title))
+            say(code)
+            if script_state["all"]:
+                return True
+            try:
+                ans = input("run this script? [y/N/a=always this session] ").strip().lower()
+            except EOFError:
+                return False
+            if ans in ("a", "always"):
+                script_state["all"] = True
+            return ans in ("y", "yes", "j", "ja", "a", "always")
+        finally:
+            ticker.resume()
+
+    if args.scripts != "off":
+        agent.tools.scripts = ScriptRunner(agent.tools, args.script_timeout, args.scripts_dir, confirm_script,
+                                           ticker.phase)
     agent.tools.protected = {Path(p).resolve() for p in (
         args.conf.path, args.conf.s.get("log") or args.conf.base / "miniharness-server.log") if p}
     say(paint("1", "miniharness") + dim(" · %s · model %s · folder %s · context %d tokens (%s) · reply reserve %d" %
@@ -2213,6 +2485,15 @@ def _run(args, client, root):
             elif cmd == "/auto":
                 state["auto"] = not state["auto"]
                 say("auto-approve " + ("on" if state["auto"] else "off"))
+            elif cmd == "/scripts":
+                sub, _, rest = arg.strip().partition(" ")
+                if agent.tools.scripts is None:
+                    say("scripts are disabled (scripts = off)")
+                elif sub == "rm" and rest.strip():
+                    say(agent.execute({"name": "run_script", "args": {"name": rest.strip(), "delete": True}}))
+                else:
+                    say(agent.tools.scripts.listing())
+                    say(dim("saved in %s/ - /scripts rm NAME deletes one" % args.scripts_dir))
             elif cmd in ("/think", "/hidethinking"):
                 args.hide_thinking = not args.hide_thinking
                 say("thinking is now " + ("hidden" if args.hide_thinking else "shown"))

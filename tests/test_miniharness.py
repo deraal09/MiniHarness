@@ -129,7 +129,7 @@ class ToolTests(Base):
 
 class AgentTests(Base):
     def make_agent(self, n_ctx, **kw):
-        args = mh.parse_args(["--dir", str(self.root)])
+        args = mh.parse_args(["--dir", str(self.root), "--scripts", "off"])
         for k, v in kw.items():
             setattr(args, k, v)
         client = mh.Client("http://127.0.0.1:1/v1")
@@ -199,6 +199,134 @@ class ThinkingTests(unittest.TestCase):
         f, out = self.run_filter(["<think>never ends"])
         self.assertEqual(out, [("think", "never ends")])
         self.assertEqual(f.text("RAW"), "")
+
+
+class ScriptTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.shown = []
+        self.allow = True
+
+        def confirm(title, code):
+            self.shown.append((title, code))
+            return self.allow
+        self.runner = mh.ScriptRunner(self.tools, timeout=20, confirm=confirm)
+        self.tools.scripts = self.runner
+
+    def test_temporary_script_runs_and_is_deleted(self):
+        out = self.runner.run(code="import os\nprint('cwd ok:', os.path.samefile(os.getcwd(), %r))\n"
+                                   "open('made.txt', 'w').write('x')" % str(self.root), name="mk")
+        self.assertTrue(out.startswith("OK: script finished (exit 0"), out)
+        self.assertIn("cwd ok: True", out)
+        self.assertIn("made.txt (new)", out)
+        self.assertIn("temporary script was deleted", out)
+        self.assertFalse(self.runner.last_path.exists())                  # script file gone
+        self.assertFalse(self.runner.last_path.parent.exists())           # and its temp folder
+        self.assertEqual((self.root / "made.txt").read_text(), "x")
+        self.assertIn("made.txt", self.tools.changed)                     # so the syntax/check loop sees it
+        self.assertIn("print('cwd ok", self.shown[0][1])                  # the user saw the code first
+        self.assertIn("temporary", self.shown[0][0])
+        self.assertFalse((self.root / "scripts").exists())
+
+    def test_declined_script_does_not_run(self):
+        self.allow = False
+        self.assertEqual(self.runner.run(code="open('nope.txt', 'w').write('x')"), "Declined by user.")
+        self.assertFalse((self.root / "nope.txt").exists())
+
+    def test_failures_and_timeout_are_errors(self):
+        out = self.runner.run(code="import sys\nprint('before')\nsys.exit(3)")
+        self.assertTrue(out.startswith("ERROR: script exited with code 3"), out)
+        self.assertIn("before", out)
+        out = self.runner.run(code="raise ValueError('boom')")
+        self.assertTrue(out.startswith("ERROR"))
+        self.assertIn("ValueError: boom", out)                            # traceback goes back to the model
+        quick = mh.ScriptRunner(self.tools, timeout=1, confirm=lambda *a: True)
+        t0 = time.time()
+        out = quick.run(code="import time\ntime.sleep(30)")
+        self.assertIn("timed out after 1 s", out)
+        self.assertLess(time.time() - t0, 10)
+        self.assertFalse(quick.last_path.exists())
+
+    def test_keep_saves_lists_reruns_and_deletes(self):
+        with self.assertRaises(mh.ToolError):
+            self.runner.run(code="print(1)", keep=True)                   # needs name + description
+        out = self.runner.run(code="import sys\nprint('args:', sys.argv[1:])", keep=True, name="report",
+                              description="weekly report")
+        self.assertIn("Saved as scripts/report.py", out)
+        saved = self.root / "scripts" / "report.py"
+        self.assertTrue(saved.read_text().startswith("# miniharness script: weekly report\n"))
+        self.assertEqual(self.runner.listing(), "report (python): weekly report")
+        out = self.runner.run(name="report", args='one "two words"')       # run by name, code shown again
+        self.assertIn("args: ['one', 'two words']", out)
+        self.assertIn("saved script", self.shown[-1][0])
+        self.assertIn("print('args:'", self.shown[-1][1])
+        self.assertTrue(saved.exists())
+        self.assertIn("OK: deleted", self.runner.run(name="report", delete=True))
+        self.assertFalse(saved.exists())
+        self.assertEqual(self.runner.listing(), "[no saved scripts]")
+
+    def test_bad_names_and_missing_scripts(self):
+        for bad in ("../evil", "a/b", "x y", "a" * 41):
+            with self.assertRaises(mh.ToolError):
+                self.runner.run(code="print(1)", name=bad)
+        with self.assertRaises(mh.ToolError):
+            self.runner.run(name="ghost")
+        with self.assertRaises(mh.ToolError):
+            self.runner.run()
+        with self.assertRaises(mh.ToolError):
+            self.runner.run(code="print(1)", language="cobol")
+
+    def test_secrets_are_not_passed_and_stdin_is_closed(self):
+        os.environ["MY_SECRET_API_KEY"] = "hunter2"
+        self.addCleanup(os.environ.pop, "MY_SECRET_API_KEY", None)
+        out = self.runner.run(code="import os, sys\nprint('key:', os.environ.get('MY_SECRET_API_KEY'))\n"
+                                   "print('stdin:', repr(sys.stdin.read()))")
+        self.assertIn("key: None", out)
+        self.assertIn("stdin: ''", out)
+
+    def test_script_cannot_rewrite_the_config(self):
+        ini = self.root / "miniharness.ini"
+        ini.write_text("[server]\ncommand = good\n")
+        self.tools.protected.add(ini.resolve())
+        out = self.runner.run(code="open('miniharness.ini', 'w').write('[server]\\ncommand = evil\\n')")
+        self.assertIn("WARNING: the script changed miniharness.ini - restored it", out)
+        self.assertEqual(ini.read_text(), "[server]\ncommand = good\n")
+
+    def test_reports_modified_and_deleted_files(self):
+        (self.root / "a.txt").write_text("1")
+        (self.root / "b.txt").write_text("1")
+        out = self.runner.run(code="import os\nopen('a.txt', 'w').write('22')\nos.remove('b.txt')")
+        self.assertIn("a.txt (modified)", out)
+        self.assertIn("b.txt (deleted)", out)
+        self.assertNotIn("b.txt", self.tools.changed)
+
+    def test_long_output_is_cut_in_the_middle(self):
+        out = self.runner.run(code="print('START'); print('x' * 100000); print('END')")
+        self.assertIn("START", out)
+        self.assertIn("END", out)
+        self.assertIn("chars cut", out)
+        self.assertLess(len(out), 3000)                                   # tools.cap() is 2000 here
+
+    @unittest.skipIf(os.name == "nt", "needs a POSIX shell")
+    def test_shell_script(self):
+        out = self.runner.run(code="echo hello from sh\nmkdir -p out && echo y > out/f.txt", language="bash")
+        self.assertIn("hello from sh", out)
+        self.assertIn("out/f.txt (new)", out)
+
+    def test_disabled_scripts(self):
+        self.tools.scripts = None
+        with self.assertRaises(mh.ToolError):
+            self.tools.run_script(code="print(1)")
+        off = mh.Agent(mh.parse_args(["--scripts", "off"]), None, self.tools, 4096)
+        on = mh.Agent(mh.parse_args(["--scripts", "ask"]), None, self.tools, 4096)
+        names = lambda a: [s["function"]["name"] for s in a.specs]
+        self.assertNotIn("run_script", names(off))
+        self.assertIn("run_script", names(on))
+        self.assertIn("list_scripts", names(on))
+        self.assertNotIn("run_script", off.system() + off.tool_json)
+        self.assertIn("run_script", on.system())
+        on.native = False
+        self.assertIn("run_script(", on.system())                         # text protocol lists it too
 
 
 class FeedbackTests(Base):
@@ -405,6 +533,21 @@ class EndToEnd(Base):
         FakeLLM.script = [{"content": "<think>x</think>Y"}]
         a2.run_turn("q")
         self.assertEqual(a2.msgs[-1]["content"], "Y")                   # ... but never stored
+
+    def test_model_writes_runs_and_discards_a_script(self):
+        FakeLLM.script = [{"tool": ("run_script", {"name": "fill", "code":
+                                                   "open('data.json', 'w').write('{\"a\": }')\nprint('written')"})},
+                          {"content": "done"},
+                          {"tool": ("edit_file", {"path": "data.json", "old": "{\"a\": }", "new": "{\"a\": 1}"})},
+                          {"content": "fixed"}]
+        a = self.make_agent("--scripts", "auto")
+        a.tools.scripts = mh.ScriptRunner(a.tools, 20, "scripts", lambda t, c: True)
+        out = self.run_capture(a, "create data.json with a script")
+        self.assertIn("written", [m["content"] for m in a.msgs if m["role"] == "tool"][0])
+        self.assertEqual((self.root / "data.json").read_text(), '{"a": 1}')    # script output was syntax-checked
+        self.assertFalse((self.root / "scripts").exists())                     # temporary: nothing left behind
+        self.assertIn("[check] problems found", out)
+        self.assertIn("run_script", [t["function"]["name"] for t in FakeLLM.requests[0]["tools"]])
 
     def test_measure_base(self):
         a = mh.Agent(mh.parse_args(["--dir", str(self.root)]), mh.Client(self.url), self.tools, 2048)
