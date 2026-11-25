@@ -112,6 +112,20 @@ run this script? [y/N/a=always this session] y
   The temporary script was deleted.
 ```
 
+- **Wann ein Script sinnvoll ist, entscheidet das Modell – und Sie erfahren es immer:**
+  - *Sinnvoll:* mechanische Arbeit, die für viele Dateien/Zeilen gleich ist und kein Verständnis des Inhalts braucht
+    (umbenennen, konvertieren, zählen, sortieren, massenhaft ersetzen, extrahieren).
+  - *Nicht sinnvoll:* 1–3 Änderungen, alles, wofür man den Inhalt verstehen muss (umschreiben, zusammenfassen, prüfen),
+    und alles, was ein einzelner Tool-Aufruf erledigt – das macht das Modell direkt.
+  - *Begründung Pflicht:* `run_script` verlangt einen kurzen Grund („why a script“). Er steht über dem Code in der
+    Rückfrage; ohne Grund wird der Aufruf abgewiesen.
+  - *Das Harness hilft bei der Entscheidung:* Bearbeitet das Modell 4 verschiedene Dateien einzeln (oder liest 8), erhält es
+    einmal pro Nachricht den Hinweis, dass ein Script schneller wäre – und Sie sehen `[hint] N files handled one by one`.
+    Das Modell kann dann ein Script vorschlagen (mit Begründung) oder weitermachen. Hat es schon ein Script benutzt, kommt kein Hinweis.
+  - *Ergebnis wird gemeldet:* eine Zeile pro Lauf, z. B. `[script] finished in 0.4s; temporary script deleted; 6 file(s)
+    changed`, bzw. `kept as scripts/report.py because it looks like a recurring task: wöchentlicher Bericht`, bei
+    Fehlern `failed: …`. Lehnen Sie ab, steht `[script] declined`, und das Modell bekommt die Anweisung, die Aufgabe ohne
+    Script zu lösen oder nachzufragen (kein erneuter Versuch mit demselben Script).
 - **Sprachen:** `python` (läuft mit dem Python, das auch das Harness nutzt – daher unter Linux und Windows gleich) und `shell`
   (bash/sh bzw. PowerShell unter Windows).
 - **Temporär ist der Normalfall:** Das Script liegt in einem temporären Ordner und wird nach dem Lauf **immer** gelöscht

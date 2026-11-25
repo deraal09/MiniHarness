@@ -104,7 +104,8 @@ SCRIPT_SPECS = [
     _spec("run_script", "Run a script for mechanical bulk work (no AI needed). Deleted after the run unless "
           "keep=true (recurring tasks only; needs name+description). No code = run saved script 'name'; "
           "delete=true removes it.",
-          {"code": ("string", ""), "language": ("string", "python|shell"), "args": ("string", ""),
+          {"code": ("string", ""), "reason": ("string", "why a script instead of by hand; the user sees it"),
+           "language": ("string", "python|shell"), "args": ("string", ""),
            "name": ("string", ""), "keep": ("boolean", ""), "description": ("string", ""),
            "delete": ("boolean", "")}),
     _spec("list_scripts", "List the saved scripts (name: description).", {}),
@@ -704,10 +705,11 @@ class ScriptRunner:
     """Lets the model write a script, run it (after the user approved the code) and throw it away again.
     Scripts the model marks as recurring are kept in <project>/<dirname>/ and can be run by name."""
 
-    def __init__(self, tools, timeout=60, dirname="scripts", confirm=None, phase=None):
+    def __init__(self, tools, timeout=60, dirname="scripts", confirm=None, phase=None, inform=None):
         self.tools, self.timeout, self.dirname = tools, timeout, dirname
         self.confirm = confirm or (lambda title, preview: False)    # confirm(title, code) -> bool
         self.phase = phase or (lambda label: None)
+        self.inform = inform or (lambda message: None)              # tells the user what was decided and why
         self.last_path = None
 
     @property
@@ -752,7 +754,8 @@ class ScriptRunner:
                 break
         return snap
 
-    def run(self, code="", language="python", args="", name="", keep=False, description="", delete=False):
+    def run(self, code="", language="python", args="", name="", keep=False, description="", delete=False,
+            reason=""):
         name = str(name or "").strip()
         if name and not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", name):
             raise ToolError("name may only contain letters, digits, - and _ (max 40)")
@@ -775,6 +778,8 @@ class ScriptRunner:
             keep = False
         else:
             lang = self.lang_of(language)
+            if not str(reason or "").strip():
+                raise ToolError("give a short reason: why a script instead of doing it by hand (the user sees it)")
             if keep and not (name and str(description or "").strip()):
                 raise ToolError("keep=true needs a name and a description of what the script is for")
             state = "will be saved as %s/%s%s" % (self.dirname, name, LANGS[lang]) if keep else "temporary"
@@ -782,9 +787,13 @@ class ScriptRunner:
         argv_extra = split_cmd(str(args or "")) if args else []
         label = name or "task"
         self.phase("")
+        why = " ".join(str(reason or "").split())[:300]
         title = "run script '%s' (%s, %s, timeout %ds, in %s)" % (label, lang, state, self.timeout, self.tools.root)
+        if why:
+            title += "\nwhy a script: " + why
         if not self.confirm(title, code.rstrip("\n")):
-            return "Declined by user."
+            self.inform("[script] declined - the model is told to do it another way")
+            return "Declined by user. Don't retry the script: do the task with the other tools, or ask the user."
         tmp = None
         try:
             if keep:                                            # save first (approved), then run from there
@@ -797,12 +806,13 @@ class ScriptRunner:
                 path = tmp / (label + LANGS[lang])
                 path.write_text(code if code.endswith("\n") else code + "\n", encoding="utf-8")
             self.last_path = path
-            return self.execute(lang, path, argv_extra, label, keep, state == "saved script")
+            return self.execute(lang, path, argv_extra, label, keep, state == "saved script",
+                                " ".join(str(description or "").split()))
         finally:
             if tmp:
                 shutil.rmtree(str(tmp), ignore_errors=True)
 
-    def execute(self, lang, path, extra, label, kept_now, was_saved):
+    def execute(self, lang, path, extra, label, kept_now, was_saved, description=""):
         tools = self.tools
         guard = {p: p.read_bytes() for p in set(tools.protected) | {tools.root / CONFIG_NAME} if p.is_file()}
         before = self.snapshot()
@@ -856,8 +866,14 @@ class ScriptRunner:
             head = "OK: script finished (exit 0, %.1fs)" % secs
         if kept_now:
             notes.append("Saved as %s - run it again with run_script name=%s" % (tools.rel(path), label))
-        elif not was_saved:
+            fate = "kept as %s because it looks like a recurring task: %s" % (tools.rel(path), description or "-")
+        elif was_saved:
+            fate = "saved script kept"
+        else:
             notes.append("The temporary script was deleted.")
+            fate = "temporary script deleted"
+        outcome = "failed: " + head[len("ERROR: "):] if head.startswith("ERROR") else "finished in %.1fs" % secs
+        self.inform("[script] %s; %s%s" % (outcome, fate, "; %d file(s) changed" % len(changes) if changes else ""))
         cap = tools.cap()
         if len(output) > cap:
             output = output[:cap * 6 // 10] + "\n...[%d chars cut]...\n" % (len(output) - cap) + output[-cap * 4 // 10:]
@@ -1043,6 +1059,7 @@ class Agent:
         self.used = 0               # tokens of the last request (prompt + reply)
         self.base, self.base_exact = 0, False   # tokens the harness itself occupies (system prompt + tools)
         self.ctx_guess = False      # n_ctx is only a default guess -> ask the server after 1st reply
+        self.work = {"edited": set(), "read": set(), "done": False}
         self.ticker = Ticker(live=False)
         self.perf = {"prompt_s": 0.0, "gen_s": 0.0, "tokens": 0}   # per turn: prompt wait, generation
         self.specs = TOOL_SPECS + (SCRIPT_SPECS if getattr(args, "scripts", "off") != "off" else [])
@@ -1069,9 +1086,11 @@ class Agent:
              "Answer in the user's language.\n"
              "Paths are relative to the project folder." % self.n_ctx)
         if len(self.specs) > len(TOOL_SPECS):
-            s += ("\n- Mechanical bulk work (rename/convert/count many files): use run_script (runs in the project "
-                  "folder). Scripts are deleted after the run; keep=true only for recurring tasks; "
-                  "check list_scripts first.")
+            s += ("\n- run_script only for mechanical work that is the same for many files/lines and needs no "
+                  "judgment (rename, convert, count, sort, bulk replace, extract). Not for 1-3 edits, not when "
+                  "you must understand the content (rewrite, summarize, review), not when one tool call does it. "
+                  "Always give a short reason (the user sees it). Scripts are deleted after the run; keep=true "
+                  "only for recurring tasks; check list_scripts first.")
         if not self.native:
             s += ("\n\nTo use a tool, write one line: TOOL: {\"name\": \"<tool>\", \"arguments\": {...}}\n"
                   "Then stop and wait for the result. Tools:\n")
@@ -1319,6 +1338,28 @@ class Agent:
         return out
 
     MAX_ERROR_STREAK = 5
+    BULK_EDITS, BULK_READS = 4, 8       # distinct files handled one by one before a script is suggested
+
+    def bulk_hint(self, c, out):
+        """The harness spots one-by-one work that a script could do and tells the model - and the user."""
+        w = self.work
+        if len(self.specs) <= len(TOOL_SPECS) or w["done"] or out.startswith(("ERROR", "Declined")):
+            return ""
+        path = (c.get("args") or {}).get("path")
+        if c["name"] == "run_script":
+            w["done"] = True
+        elif c["name"] in ("edit_file", "write_file") and path:
+            w["edited"].add(path)
+        elif c["name"] == "read_file" and path:
+            w["read"].add(path)
+        if len(w["edited"]) < self.BULK_EDITS and len(w["read"]) < self.BULK_READS:
+            return ""
+        w["done"] = True
+        n = max(len(w["edited"]), len(w["read"]))
+        say(paint("36", "[hint] %d files handled one by one - suggested a script to the model" % n))
+        return ("\n[Hint from the harness: you have handled %d files one by one. If the rest is mechanical "
+                "(the same operation on many files), do it with run_script and give a reason; otherwise "
+                "carry on.]" % n)
 
     def verify(self):
         """Check the files changed in this turn (syntax, optional command) -> report for the model,
@@ -1352,6 +1393,7 @@ class Agent:
     def run_turn(self, text):
         self.perf = {"prompt_s": 0.0, "gen_s": 0.0, "tokens": 0}
         self.tools.changed.clear()
+        self.work = {"edited": set(), "read": set(), "done": False}
         rounds, streak, last_fail = 0, 0, None
         self.msgs.append({"role": "user", "content": text})
         try:
@@ -1395,6 +1437,7 @@ class Agent:
                         last_fail = sig
                     else:
                         streak, last_fail = 0, None
+                    out += self.bulk_hint(c, out)
                     first = "  " + out.split("\n")[0][:100] + (" ..." if "\n" in out else "")
                     say(paint("31", first) if out.startswith("ERROR") else dim(first))
                     if self.native:
@@ -2386,7 +2429,7 @@ def _run(args, client, root):
 
     if args.scripts != "off":
         agent.tools.scripts = ScriptRunner(agent.tools, args.script_timeout, args.scripts_dir, confirm_script,
-                                           ticker.phase)
+                                           ticker.phase, lambda message: say(paint("36", message)))
     agent.tools.protected = {Path(p).resolve() for p in (
         args.conf.path, args.conf.s.get("log") or args.conf.base / "miniharness-server.log") if p}
     say(paint("1", "miniharness") + dim(" · %s · model %s · folder %s · context %d tokens (%s) · reply reserve %d" %
